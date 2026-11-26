@@ -150,6 +150,7 @@ class BlockList {
 public:
     BlockList(int allowed_fd, int blocked_fd, int stats_fd, int proto_stats_fd, const std::unordered_set<std::uint32_t>& allow, Storage* storage = nullptr)
     : allowed_fd_{allowed_fd}, blocked_fd_{blocked_fd}, stats_fd_{stats_fd}, proto_stats_fd_{proto_stats_fd}, storage_{storage},
+      host_{[]{ char buf[256]; return gethostname(buf, sizeof(buf)) == 0 ? std::string(buf) : std::string("local"); }()},
       sweeper_{[this](std::stop_token st) { sweep_loop(st); }} {
         for (std::uint32_t ip : allow) {
             allow_ip(ip);
@@ -197,12 +198,24 @@ public:
         }
         std::string label = manual ? "manual" : "automatic";
         print_log("[BLOCKED]", ip_to_string(ip) + " ttl=" + std::to_string(duration.count()) + "s " + label, "\x1b[31m");
+
+        // Persist the decision so the Local API can serve it to bouncers
+        // independent of this process's lifetime (ROADMAP.md phase 1).
+        if (storage_) {
+            long long expires_unix = (duration.count() > 0)
+                ? static_cast<long long>(std::time(nullptr)) + duration.count()
+                : 0;
+            storage_->insert_decision({ip_to_string(ip), "block", std::string(reason), std::string(reason), expires_unix, static_cast<int>(duration.count()), host_});
+        }
         return true;
     }
 
     void unblock(std::uint32_t ip) {
         if (bpf_map_delete_elem(blocked_fd_, &ip) == 0) {
             print_log("[EXPIRED]", ip_to_string(ip) + " (manual unblock)");
+            if (storage_) {
+                storage_->insert_decision({ip_to_string(ip), "unblock", "manual unblock", "", 0, 0, host_});
+            }
         }
     }
 
@@ -296,6 +309,7 @@ private:
     int stats_fd_;
     int proto_stats_fd_;
     Storage* storage_;
+    std::string host_;
     std::jthread sweeper_;
 };
 
