@@ -153,6 +153,36 @@ While `./engine` is running, you can type commands directly into its terminal:
 
 ---
 
+## 🧭 Local API (decisions + export)
+
+A separate `local-api` binary reads the same `engine.db` SQLite file the
+engine writes to, and exposes it over HTTP. This is the first piece of the
+architecture described in [`ROADMAP.md`](ROADMAP.md) — see
+[`docs/adr/0001-architecture.md`](docs/adr/0001-architecture.md) for why.
+
+```bash
+make local-api
+LOCAL_API_TOKEN=your-secret ./local-api engine.db 8088
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /healthz` | Liveness check, no auth required |
+| `GET /decisions` | Active block decisions, as served to bouncers |
+| `GET /export?type=alerts\|events&format=csv\|json&since=&until=` | Evidence export, filterable by ISO-8601 timestamp range |
+
+Every request other than `/healthz` requires `Authorization: Bearer <token>`
+matching `LOCAL_API_TOKEN`. If that variable is unset, the API logs a
+warning and runs unauthenticated — fine for local testing, not for anything
+reachable beyond localhost.
+
+```bash
+curl -H "Authorization: Bearer your-secret" \
+  "http://127.0.0.1:8088/export?type=alerts&format=csv" -o alerts.csv
+```
+
+---
+
 ## 🖥️ Live Showcase Dashboard
 
 Navigate to **`http://127.0.0.1:5000/?showcase=1`** for the presentation/exhibition UI:

@@ -2,6 +2,9 @@
 #include <stdexcept>
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <ctime>
+#include <nlohmann/json.hpp>
 
 Storage::Storage(const std::string& db_path) {
     sqlite3* db_raw = nullptr;
@@ -39,6 +42,19 @@ Storage::Storage(const std::string& db_path) {
     
     sqlite3_prepare_v2(db_.get(), "UPDATE offenders SET offense_count = 0 WHERE ip = ?", -1, &stmt, nullptr);
     reset_offense_stmt_.reset(stmt);
+
+    sqlite3_prepare_v2(db_.get(), "INSERT INTO decisions(ts, ip, action, reason, rule, expires_at_unix, ttl_seconds, host) VALUES(datetime('now'), ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
+    insert_decision_stmt_.reset(stmt);
+
+    // Latest row per IP wins; only a still-active "block" is served.
+    sqlite3_prepare_v2(db_.get(),
+        "SELECT ip, reason, rule, expires_at_unix, ttl_seconds, host FROM ("
+        "  SELECT ip, action, reason, rule, expires_at_unix, ttl_seconds, host,"
+        "         ROW_NUMBER() OVER (PARTITION BY ip ORDER BY id DESC) AS rn"
+        "  FROM decisions"
+        ") WHERE rn = 1 AND action = 'block' AND (expires_at_unix = 0 OR expires_at_unix > ?)",
+        -1, &stmt, nullptr);
+    get_active_decisions_stmt_.reset(stmt);
 }
 
 void Storage::exec_schema() {
@@ -64,6 +80,11 @@ void Storage::exec_schema() {
             offense_count INTEGER,
             last_offense INTEGER
         );
+        CREATE TABLE IF NOT EXISTS decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT, ip TEXT, action TEXT, reason TEXT, rule TEXT,
+            expires_at_unix INTEGER, ttl_seconds INTEGER, host TEXT
+        );
     )";
     char* err = nullptr;
     if (sqlite3_exec(db_.get(), schema, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -71,11 +92,15 @@ void Storage::exec_schema() {
         sqlite3_free(err);
         throw std::runtime_error("sqlite schema error: " + e);
     }
-    
+
     // Attempt to add label column for backwards compatibility
     sqlite3_exec(db_.get(), "ALTER TABLE alerts ADD COLUMN label TEXT", nullptr, nullptr, nullptr);
     sqlite3_exec(db_.get(), "ALTER TABLE metrics ADD COLUMN syn_limit INTEGER DEFAULT 200", nullptr, nullptr, nullptr);
     sqlite3_exec(db_.get(), "ALTER TABLE metrics ADD COLUMN xdp_mode TEXT DEFAULT 'unknown'", nullptr, nullptr, nullptr);
+    // Added for the Local API / multi-host export (ROADMAP.md phase 1); default
+    // keeps existing single-host rows meaningful without a backfill.
+    sqlite3_exec(db_.get(), "ALTER TABLE alerts ADD COLUMN host TEXT DEFAULT 'local'", nullptr, nullptr, nullptr);
+    sqlite3_exec(db_.get(), "ALTER TABLE events ADD COLUMN host TEXT DEFAULT 'local'", nullptr, nullptr, nullptr);
 }
 
 void Storage::insert_event(const Event& e) {
@@ -302,6 +327,133 @@ void Storage::generate_report(const std::string& path) {
 void Storage::wipe_history() {
     std::lock_guard<std::mutex> lock(db_mutex_);
     char* err = nullptr;
-    sqlite3_exec(db_.get(), "DELETE FROM events; DELETE FROM alerts; DELETE FROM actions; DELETE FROM metrics; DELETE FROM offenders;", nullptr, nullptr, &err);
+    sqlite3_exec(db_.get(), "DELETE FROM events; DELETE FROM alerts; DELETE FROM actions; DELETE FROM metrics; DELETE FROM offenders; DELETE FROM decisions;", nullptr, nullptr, &err);
     if (err) sqlite3_free(err);
+}
+
+void Storage::insert_decision(const Decision& d) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    sqlite3_reset(insert_decision_stmt_.get());
+    sqlite3_bind_text(insert_decision_stmt_.get(), 1, d.ip.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(insert_decision_stmt_.get(), 2, d.action.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(insert_decision_stmt_.get(), 3, d.reason.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(insert_decision_stmt_.get(), 4, d.rule.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(insert_decision_stmt_.get(), 5, d.expires_at_unix);
+    sqlite3_bind_int(insert_decision_stmt_.get(), 6, d.ttl_seconds);
+    sqlite3_bind_text(insert_decision_stmt_.get(), 7, d.host.c_str(), -1, SQLITE_STATIC);
+    if (sqlite3_step(insert_decision_stmt_.get()) != SQLITE_DONE) {
+        std::cerr << "[error] decision insert failed: " << sqlite3_errmsg(db_.get()) << "\n";
+    }
+}
+
+std::vector<Decision> Storage::get_active_decisions() {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    std::vector<Decision> out;
+    sqlite3_reset(get_active_decisions_stmt_.get());
+    sqlite3_bind_int64(get_active_decisions_stmt_.get(), 1, static_cast<sqlite3_int64>(std::time(nullptr)));
+    while (sqlite3_step(get_active_decisions_stmt_.get()) == SQLITE_ROW) {
+        Decision d;
+        auto* stmt = get_active_decisions_stmt_.get();
+        const unsigned char* ip = sqlite3_column_text(stmt, 0);
+        const unsigned char* reason = sqlite3_column_text(stmt, 1);
+        const unsigned char* rule = sqlite3_column_text(stmt, 2);
+        const unsigned char* host = sqlite3_column_text(stmt, 5);
+        d.ip = ip ? (const char*)ip : "";
+        d.action = "block";
+        d.reason = reason ? (const char*)reason : "";
+        d.rule = rule ? (const char*)rule : "";
+        d.expires_at_unix = sqlite3_column_int64(stmt, 3);
+        d.ttl_seconds = sqlite3_column_int(stmt, 4);
+        d.host = host ? (const char*)host : "local";
+        out.push_back(std::move(d));
+    }
+    return out;
+}
+
+namespace {
+std::string csv_escape(const std::string& field) {
+    if (field.find_first_of(",\"\n\r") == std::string::npos) return field;
+    std::string escaped = "\"";
+    for (char c : field) {
+        if (c == '"') escaped += '"';
+        escaped += c;
+    }
+    escaped += '"';
+    return escaped;
+}
+} // namespace
+
+// Serializes whatever columns `sql` selects into CSV or JSON, generically —
+// this is what lets export_alerts/export_events share one code path despite
+// having different schemas.
+std::string Storage::run_export(const std::string& sql, const std::vector<std::string>& binds, const std::string& format) {
+    std::lock_guard<std::mutex> lock(db_mutex_);
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_.get(), sql.c_str(), -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        throw std::runtime_error("export query failed to prepare: " + std::string(sqlite3_errmsg(db_.get())));
+    }
+    StmtPtr stmt(raw_stmt);
+    for (size_t i = 0; i < binds.size(); ++i) {
+        sqlite3_bind_text(stmt.get(), static_cast<int>(i + 1), binds[i].c_str(), -1, SQLITE_STATIC);
+    }
+
+    const int cols = sqlite3_column_count(stmt.get());
+    const bool as_json = (format == "json");
+
+    if (as_json) {
+        nlohmann::json arr = nlohmann::json::array();
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            nlohmann::json row;
+            for (int i = 0; i < cols; ++i) {
+                const char* name = sqlite3_column_name(stmt.get(), i);
+                switch (sqlite3_column_type(stmt.get(), i)) {
+                    case SQLITE_INTEGER: row[name] = sqlite3_column_int64(stmt.get(), i); break;
+                    case SQLITE_FLOAT:   row[name] = sqlite3_column_double(stmt.get(), i); break;
+                    case SQLITE_NULL:    row[name] = nullptr; break;
+                    default: {
+                        const unsigned char* t = sqlite3_column_text(stmt.get(), i);
+                        row[name] = t ? std::string((const char*)t) : std::string();
+                    }
+                }
+            }
+            arr.push_back(std::move(row));
+        }
+        return arr.dump();
+    }
+
+    std::ostringstream out;
+    for (int i = 0; i < cols; ++i) {
+        if (i) out << ',';
+        out << csv_escape(sqlite3_column_name(stmt.get(), i));
+    }
+    out << "\r\n";
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        for (int i = 0; i < cols; ++i) {
+            if (i) out << ',';
+            if (sqlite3_column_type(stmt.get(), i) != SQLITE_NULL) {
+                const unsigned char* t = sqlite3_column_text(stmt.get(), i);
+                out << csv_escape(t ? (const char*)t : "");
+            }
+        }
+        out << "\r\n";
+    }
+    return out.str();
+}
+
+std::string Storage::export_alerts(const std::string& format, const std::string& since_iso, const std::string& until_iso) {
+    std::string sql = "SELECT id, ts, host, rule, src_ip, severity, mitre, action, block_seconds, label FROM alerts WHERE 1=1";
+    std::vector<std::string> binds;
+    if (!since_iso.empty()) { sql += " AND ts >= ?"; binds.push_back(since_iso); }
+    if (!until_iso.empty()) { sql += " AND ts <= ?"; binds.push_back(until_iso); }
+    sql += " ORDER BY id ASC";
+    return run_export(sql, binds, format);
+}
+
+std::string Storage::export_events(const std::string& format, const std::string& since_iso, const std::string& until_iso) {
+    std::string sql = "SELECT id, ts, host, source, type, src_ip, user, severity FROM events WHERE 1=1";
+    std::vector<std::string> binds;
+    if (!since_iso.empty()) { sql += " AND ts >= ?"; binds.push_back(since_iso); }
+    if (!until_iso.empty()) { sql += " AND ts <= ?"; binds.push_back(until_iso); }
+    sql += " ORDER BY id ASC";
+    return run_export(sql, binds, format);
 }

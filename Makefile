@@ -11,7 +11,7 @@ ifneq ($(ARCH_INC),)
 BPF_CFLAGS += -I$(ARCH_INC)
 endif
 
-all: xdp_prog.bpf.o engine engine-cli
+all: xdp_prog.bpf.o engine engine-cli local-api
 
 # Stage 1: C -> BPF bytecode inside an ELF object
 xdp_prog.bpf.o: xdp_prog.bpf.c
@@ -24,12 +24,18 @@ engine: engine.cpp rule_engine.cpp rule_engine.h storage.cpp storage.h playbook_
 engine-cli: engine-cli.cpp
 	$(CXX) -O2 -Wall -Wextra engine-cli.cpp -o $@
 
+# Local API: the shared control plane (ROADMAP.md phase 1). No BPF/libcurl
+# dependency — it only needs the storage layer and an HTTP server.
+HTTPLIB_FLAGS := $(shell pkg-config --cflags --libs cpp-httplib 2>/dev/null)
+local-api: local_api.cpp storage.cpp storage.h
+	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
+
 clean:
-	rm -f xdp_prog.bpf.o engine engine-cli
+	rm -f xdp_prog.bpf.o engine engine-cli local-api
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp rule_engine.cpp http_detector.cpp
-	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp
+test: tests/test_logic.cpp tests/test_storage.cpp rule_engine.cpp http_detector.cpp storage.cpp
+	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 
 # Stage 4: Sanitizer build

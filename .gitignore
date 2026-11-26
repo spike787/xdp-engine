@@ -1,8 +1,11 @@
 engine
-*.o
-.env
-
-engine.db*
 engine-cli
+local-api
+engine_asan
+test_logic
+*.o
+
+.env
+engine.db*
 __pycache__/
 
