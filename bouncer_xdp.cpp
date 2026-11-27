@@ -145,6 +145,29 @@ bool already_attached() {
     return access(pin_path("link_xdp_firewall").c_str(), F_OK) == 0;
 }
 
+// Walks the kernel's blocked_ips map and returns every IP currently
+// enforced there. This is only needed on resume: when we re-attach fresh,
+// the map starts empty and `currently_enforced` tracking it from {} is
+// correct. But on resume against an *existing* pinned map, some other
+// (now-dead) bouncer-xdp process may have left IPs blocked that are no
+// longer in Local API's /decisions - without seeding `currently_enforced`
+// from the real map contents first, diff_decisions() would never compute
+// those as `to_remove` (its to_remove is `currently_enforced - desired`,
+// and an empty currently_enforced can never produce a removal), leaving
+// them blocked forever.
+std::unordered_set<std::uint32_t> read_enforced_ips(int blocked_fd) {
+    std::unordered_set<std::uint32_t> out;
+    std::uint32_t key;
+    std::uint32_t next_key;
+    bool have_key = false;
+    while (bpf_map_get_next_key(blocked_fd, have_key ? &key : nullptr, &next_key) == 0) {
+        out.insert(next_key);
+        key = next_key;
+        have_key = true;
+    }
+    return out;
+}
+
 // --- cleanup subcommand --------------------------------------------------
 
 int run_cleanup(const std::string& iface) {
@@ -286,7 +309,15 @@ int main(int argc, char** argv) {
     std::cout << "[bouncer-xdp] polling " << lapi_url << "/decisions every "
               << poll_interval_s << "s\n";
 
-    std::unordered_set<std::uint32_t> currently_enforced;
+    // Seed currently_enforced from the real map contents. On a fresh
+    // attach the map is empty, so this is a no-op; on resume it's what
+    // lets the first poll correctly release anything that should no
+    // longer be blocked (see read_enforced_ips's comment).
+    std::unordered_set<std::uint32_t> currently_enforced = read_enforced_ips(blocked_fd);
+    if (!currently_enforced.empty()) {
+        std::cout << "[bouncer-xdp] resuming with " << currently_enforced.size()
+                  << " IP(s) already enforced in the kernel map\n";
+    }
 
     while (g_running) {
         std::unordered_set<std::uint32_t> desired;
