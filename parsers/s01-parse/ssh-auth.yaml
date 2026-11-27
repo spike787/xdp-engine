@@ -1,0 +1,17 @@
+# Envelope parser for SSH auth log lines (/var/log/secure or
+# /var/log/auth.log), loaded by SshDetector (engine.cpp) via LogParser
+# (log_parser.h). See docs/adr/0003-staged-parser-pipeline.md.
+#
+# This is a direct, verbatim lift of what used to be a hardcoded
+# std::regex inside SshDetector::handle_line - the matching behavior is
+# unchanged, only where the pattern lives has moved.
+name: ssh-auth-failed-password
+source: ssh_log
+pattern: 'Failed password for (?:invalid user )?(\S+) from (\d{1,3}(?:\.\d{1,3}){3}) port \d+ ssh2'
+fields:
+  - name: user
+    group: 1
+  - name: ip
+    group: 2
+emit_type: ssh_failed
+severity: 3

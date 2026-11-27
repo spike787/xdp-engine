@@ -1,0 +1,23 @@
+# Envelope parser for nginx's combined log format
+# (/var/log/nginx/access.log), loaded by HttpDetector (http_detector.cpp)
+# via LogParser (log_parser.h). See
+# docs/adr/0003-staged-parser-pipeline.md.
+#
+# This only replaces the envelope regex that used to be hardcoded in
+# HttpDetector::process_line - it extracts ip/path/user_agent and nothing
+# more. Classifying a request as http_traversal/http_sqli/http_scanner by
+# testing path/user_agent against pattern lists is unchanged and still
+# reads those patterns from rules.yaml, since that data was already
+# externalized before this phase.
+name: nginx-combined-access
+source: http_log
+pattern: '^(\S+)\s+\S+\s+\S+\s+\[.*?\]\s+"(?:[A-Z]+)\s+(\S+)\s+.*?"\s+\d+\s+\d+\s+"(?:[^"]*)"\s+"([^"]*)"'
+fields:
+  - name: ip
+    group: 1
+  - name: path
+    group: 2
+    url_decode: true
+  - name: user_agent
+    group: 3
+severity: 3

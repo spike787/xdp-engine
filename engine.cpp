@@ -45,6 +45,7 @@
 #include "notifier.h"
 #include "http_detector.h"
 #include "log_tailer.h"
+#include "log_parser.h"
 #include "text_util.h"
 #include "utils.h"
 
@@ -361,33 +362,37 @@ using EventCallback = std::function<void(const Event&)>;
 
 class SshDetector {
 public:
+    // The envelope regex used to be hardcoded right here; it now lives in
+    // parsers/s01-parse/ssh-auth.yaml (see docs/adr/0003-staged-parser-
+    // pipeline.md) and is loaded through LogParser instead.
     SshDetector(std::string path, EventCallback cb)
-        : cb_(std::move(cb)), tailer_(std::move(path), [this](const std::string& line) { handle_line(line); }) {}
-    
+        : cb_(std::move(cb)),
+          parser_("parsers/s01-parse/ssh-auth.yaml"),
+          tailer_(std::move(path), [this](const std::string& line) { handle_line(line); }) {}
+
     void run(std::stop_token st) { tailer_.run(st); }
 
 private:
     void handle_line(const std::string& line) {
-        static const std::regex re{R"(Failed password for (?:invalid user )?(\S+) from (\d{1,3}(?:\.\d{1,3}){3}) port \d+ ssh2)"};
-        std::smatch m;
-        if (!std::regex_search(line, m, re)) return;
+        std::unordered_map<std::string, std::string> fields;
+        if (!parser_.parse(line, fields)) return;
 
-        std::string user = sanitize_utf8(m[1].str());
-        std::string ip_str = m[2].str();
-
-        if (!parse_ipv4_local(ip_str)) return;
+        auto ip_it = fields.find("ip");
+        if (ip_it == fields.end() || !parse_ipv4_local(ip_it->second)) return;
 
         Event e;
         e.ts_iso = get_iso_time_str();
-        e.source = "ssh_log";
-        e.type = "ssh_failed";
-        e.src_ip = ip_str;
-        e.user = user;
-        e.severity = 3;
-        
+        e.source = parser_.source();
+        e.type = parser_.emit_type();
+        e.src_ip = ip_it->second;
+        auto user_it = fields.find("user");
+        e.user = (user_it != fields.end()) ? user_it->second : "";
+        e.severity = parser_.severity();
+
         if (cb_) cb_(e);
     }
     EventCallback cb_;
+    LogParser parser_;
     LogTailer tailer_;
 };
 

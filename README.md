@@ -22,15 +22,16 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 5. [Interactive Console Commands](#-interactive-console-commands)
 6. [Local API (decisions + export)](#-local-api-decisions--export)
 7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
-8. [Live Showcase Dashboard](#-live-showcase-dashboard)
-9. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
-   - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
-   - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
-   - [Test 3: Network Port Scanning](#3-network-port-scanning)
-   - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
-   - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-10. [Configuration Files](#-configuration-files)
-11. [Troubleshooting & FAQ](#-troubleshooting--faq)
+8. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
+9. [Live Showcase Dashboard](#-live-showcase-dashboard)
+10. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+    - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
+    - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
+    - [Test 3: Network Port Scanning](#3-network-port-scanning)
+    - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
+    - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
+11. [Configuration Files](#-configuration-files)
+12. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -238,6 +239,47 @@ reads it; `--lapi-token` overrides it.
 
 ---
 
+## 🧩 Detection Parsers (staged pipeline)
+
+The regex that recognizes a raw log line and extracts named fields from
+it (an IP, a username, a request path, a user-agent) lives in versioned
+YAML under `parsers/s01-parse/`, not hardcoded in C++ — see
+[ADR-0003](docs/adr/0003-staged-parser-pipeline.md). `SshDetector` and
+`HttpDetector` each load one of these at startup via the `LogParser`
+class (`log_parser.h`):
+
+* **`parsers/s01-parse/ssh-auth.yaml`** — matches `Failed password for ...`
+  lines from `/var/log/secure`/`/var/log/auth.log`, extracting `user` and
+  `ip`.
+* **`parsers/s01-parse/nginx-access.yaml`** — matches nginx's combined log
+  format, extracting `ip`, `path` (URL-decoded), and `user_agent`.
+
+A parser file looks like this:
+
+```yaml
+name: ssh-auth-failed-password
+source: ssh_log
+pattern: 'Failed password for (?:invalid user )?(\S+) from (\d{1,3}(?:\.\d{1,3}){3}) port \d+ ssh2'
+fields:
+  - name: user
+    group: 1          # 1-based regex capture group
+  - name: ip
+    group: 2
+emit_type: ssh_failed  # fixed event type for this source; omit if
+                       # classification depends on the extracted fields
+                       # (see nginx-access.yaml, classified against
+                       # rules.yaml's http_traversal/http_sqli/
+                       # http_scanner pattern lists instead)
+severity: 3
+```
+
+This only replaces *envelope* parsing. The attack-signature pattern lists
+that classify an HTTP request as traversal/SQLi/scanner already live in
+`rules.yaml` and are untouched by this — see the ADR for why those
+weren't also duplicated into parser YAML.
+
+---
+
 ## 🖥️ Live Showcase Dashboard
 
 Navigate to **`http://127.0.0.1:5000/?showcase=1`** for the presentation/exhibition UI:
@@ -341,6 +383,7 @@ sudo hping3 -S -p 80 --flood --rand-source <SERVER_IP>
 * **`playbooks.yaml`:** Configures response actions per rule (e.g. kernel block duration, Slack/webhook notifications, escalation paths).
 * **`known_ips.txt`:** Permanent administrative IP whitelist.
 * **`blocklist.txt`:** Static permanent IP blacklist loaded on boot.
+* **`parsers/s01-parse/*.yaml`:** Per-log-source envelope parsers (regex + field extraction) — see [Detection Parsers](#-detection-parsers-staged-pipeline).
 
 ---
 
