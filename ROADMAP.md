@@ -44,14 +44,14 @@ Network traffic & logs
 Attacker traffic dropped network-wide
 ```
 
-## Phases and review mapping
+## Phases
 
-| Phase | Window | Scope | Maps to |
-|---|---|---|---|
-| 1. Foundation | Now → mid-Dec | Local API (decisions/alerts/export), split XDP enforcement into its own bouncer binary that polls the API instead of deciding things in-process | Review I (15%) |
-| 2. Detection content as data | Mid-Dec → Jan | Staged parser pipeline (raw/parse/enrich) in YAML instead of hardcoded regex; second bouncer (nftables); replay/backtest CLI | — |
-| 3. Pluggable enforcement + hardening | Jan → Feb | Third bouncer (proxy/app-layer); Prometheus metrics; capability drop instead of root; parser fuzzing; IPv6 header parsing | Review II (25%) |
-| 4. Proof at small scale | Feb → March | Multi-host lab (2-3 nodes sharing one Local API); 10-scenario attack testbench with measured results; packaging (Docker Compose, systemd); report + poster | Review III (60%) |
+| Phase | Window | Scope |
+|---|---|---|
+| 1. Foundation | Now → mid-Dec | Local API (decisions/alerts/export), split XDP enforcement into its own bouncer binary that polls the API instead of deciding things in-process |
+| 2. Detection content as data | Mid-Dec → Jan | Staged parser pipeline (raw/parse/enrich) in YAML instead of hardcoded regex; second bouncer (nftables); replay/backtest CLI |
+| 3. Pluggable enforcement + hardening | Jan → Feb | Third bouncer (proxy/app-layer); Prometheus metrics; capability drop instead of root; parser fuzzing; IPv6 header parsing |
+| 4. Proof at small scale | Feb → March | Multi-host lab (2-3 nodes sharing one Local API); 10-scenario attack testbench with measured results; packaging (Docker Compose, systemd) |
 
 ## Additions agreed in planning
 
