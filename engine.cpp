@@ -471,7 +471,7 @@ int main(int argc, char** argv) {
     bool all_pass = true;
     auto check_fail = [&](const std::string& msg) {
         std::cerr << "FAIL: " << msg << "\n";
-        
+        all_pass = false;
     };
 
     if (getuid() != 0) check_fail("Not running as root. Fix: use sudo");
@@ -522,11 +522,24 @@ int main(int argc, char** argv) {
     else std::cout << "WARN: PasswordAuth not explicitly 'yes'. Failed password lines will not appear in logs if disabled!\n";
 
     if (ifindex > 0) {
-        __u32 prog_id = 0;
-        if (bpf_xdp_query_id(ifindex, 0, &prog_id) == 0 && prog_id > 0) {
-            check_fail("XDP program already attached (ID: " + std::to_string(prog_id) + "). Fix: sudo ./engine cleanup " + iface);
+        // Post-ADR-0002, bouncer-xdp - not engine - owns attaching the XDP
+        // program, and it stays attached across restarts by design (that's
+        // the whole point of pinning the link). So an attached program here
+        // is the *expected*, healthy state, not a conflict: this used to
+        // check for "no existing XDP program" (back when engine attached
+        // its own), which would now spuriously fail on every normal
+        // startup. What engine actually needs is for bouncer-xdp's pinned
+        // maps to exist - XdpEngine's constructor will bpf_obj_get() them
+        // and throw if they're missing - so check for that instead, which
+        // gives a much more actionable failure than "XDP already attached"
+        // ever did.
+        std::string link_pin = std::string(XDP_ENGINE_PIN_DIR) + "/link_xdp_firewall";
+        if (access(link_pin.c_str(), F_OK) == 0) {
+            std::cout << "PASS: bouncer-xdp is attached to " << iface
+                      << " (pinned maps found under " << XDP_ENGINE_PIN_DIR << ")\n";
         } else {
-            std::cout << "PASS: No existing XDP program attached to " << iface << "\n";
+            check_fail("bouncer-xdp is not attached to " + iface + " yet - no pinned link found under " +
+                       std::string(XDP_ENGINE_PIN_DIR) + ". Fix: start it first: sudo ./bouncer-xdp " + iface);
         }
     }
 
