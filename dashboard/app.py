@@ -50,13 +50,26 @@ def api_summary():
         db = get_db()
         total_events = db.execute("SELECT count(*) FROM events").fetchone()[0]
         total_alerts = db.execute("SELECT count(*) FROM alerts").fetchone()[0]
-        # Estimate active blocks (blocks in the last 10 minutes)
+        # Active blocks, straight from the decisions table - the same
+        # source of truth bouncer-xdp polls via Local API's /decisions.
+        # This used to be estimated from alerts/actions rows instead, which
+        # missed two cases: a manual `block <ip>` (engine.cpp) never writes
+        # an alerts row at all, so it never counted as active here even
+        # though it's actively enforced; and `unblock <ip>` only records an
+        # "unblock" row in decisions, never an "unblocked" row in actions
+        # (which is what the old NOT EXISTS clause checked for), so a
+        # manually-unblocked IP kept counting as blocked here until its
+        # original TTL happened to elapse. Querying decisions directly -
+        # latest row per IP wins, only a still-active "block" counts -
+        # avoids both.
         active_blocks = db.execute("""
-            SELECT count(*) FROM actions a 
-            WHERE action='block' AND datetime(ts) > datetime('now', '-10 minutes')
-            AND NOT EXISTS (
-                SELECT 1 FROM actions act WHERE act.action='unblocked' AND act.src_ip = a.src_ip AND act.ts >= a.ts
+            SELECT count(*) FROM (
+                SELECT ip, action, expires_at_unix,
+                       ROW_NUMBER() OVER (PARTITION BY ip ORDER BY id DESC) AS rn
+                FROM decisions
             )
+            WHERE rn = 1 AND action = 'block'
+              AND (expires_at_unix = 0 OR expires_at_unix > strftime('%s', 'now'))
         """).fetchone()[0]
         
         # Total drops (max dropped metric)
@@ -171,30 +184,33 @@ def api_panels():
     try:
         db = get_db()
         
+        # Same fix as api_summary's active_blocks count: read the decisions
+        # table (the actual enforcement source of truth bouncer-xdp polls),
+        # not alerts/actions, so manual blocks show up and manual unblocks
+        # are reflected immediately instead of only at the original TTL.
         rows = db.execute("""
-            SELECT a.src_ip, a.block_seconds, 
-                   CAST((strftime('%s', 'now') - strftime('%s', a.ts)) AS INTEGER) as age,
-                   o.offense_count
-            FROM alerts a 
-            LEFT JOIN offenders o ON a.src_ip = o.ip 
-            WHERE a.action = 'block' AND a.block_seconds > 0
-            AND NOT EXISTS (
-                SELECT 1 FROM actions act 
-                WHERE act.action = 'unblocked' 
-                AND act.src_ip = a.src_ip 
-                AND act.ts >= a.ts
-            )
+            SELECT d.ip, d.expires_at_unix, d.ttl_seconds, o.offense_count
+            FROM (
+                SELECT ip, action, expires_at_unix, ttl_seconds,
+                       ROW_NUMBER() OVER (PARTITION BY ip ORDER BY id DESC) AS rn
+                FROM decisions
+            ) d
+            LEFT JOIN offenders o ON d.ip = o.ip
+            WHERE d.rn = 1 AND d.action = 'block'
+              AND (d.expires_at_unix = 0 OR d.expires_at_unix > strftime('%s', 'now'))
         """).fetchall()
-        
+
+        now_unix = int(time.time())
         active_blocks = []
         for r in rows:
-            remain = r['block_seconds'] - r['age']
-            if remain > 0:
-                active_blocks.append({
-                    "ip": r['src_ip'],
-                    "remain": remain,
-                    "offense": r['offense_count'] or 0
-                })
+            permanent = (r['expires_at_unix'] == 0)
+            remain = 0 if permanent else max(r['expires_at_unix'] - now_unix, 0)
+            active_blocks.append({
+                "ip": r['ip'],
+                "remain": remain,
+                "permanent": permanent,
+                "offense": r['offense_count'] or 0
+            })
                 
         offenders = db.execute("SELECT ip, offense_count, last_offense FROM offenders ORDER BY offense_count DESC, last_offense DESC LIMIT 10").fetchall()
         

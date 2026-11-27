@@ -347,7 +347,7 @@
                     let tr = document.createElement('tr');
                     let td1 = document.createElement('td'); td1.textContent = b.ip; tr.appendChild(td1);
                     let td2 = document.createElement('td'); td2.textContent = b.offense; tr.appendChild(td2);
-                    let td3 = document.createElement('td'); td3.textContent = formatTime(b.remain); tr.appendChild(td3);
+                    let td3 = document.createElement('td'); td3.textContent = b.permanent ? 'permanent' : formatTime(b.remain); tr.appendChild(td3);
                     abEl.appendChild(tr);
                 });
                 

@@ -24,10 +24,22 @@ namespace {
 // Constant-time-ish compare to avoid the most obvious timing side channel
 // on the bearer token check. Not a substitute for TLS/mTLS (see
 // ROADMAP.md phase 3), but cheap to get right now.
+//
+// Deliberately does NOT short-circuit on a.size() != b.size(): an early
+// return there would still run in time proportional to whether the
+// lengths matched, letting a remote attacker binary-search the real
+// token's length (by timing requests with Authorization headers of
+// different lengths) before attacking its content. Instead, the length
+// mismatch is folded into the same accumulator as the byte comparison,
+// and the loop always runs max(a.size(), b.size()) iterations.
 bool tokens_match(const std::string& a, const std::string& b) {
-    if (a.size() != b.size()) return false;
-    unsigned char diff = 0;
-    for (size_t i = 0; i < a.size(); ++i) diff |= (unsigned char)(a[i] ^ b[i]);
+    unsigned char diff = static_cast<unsigned char>(a.size() != b.size());
+    size_t n = a.size() > b.size() ? a.size() : b.size();
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= ca ^ cb;
+    }
     return diff == 0;
 }
 

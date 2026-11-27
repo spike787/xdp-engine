@@ -110,7 +110,7 @@
                                     <span class="font-bold text-lg text-red-400">${b.ip}</span>
                                     <span class="text-xs px-2 py-1 bg-red-900/50 text-red-300 rounded uppercase">BLOCKED</span>
                                 </div>
-                                <div class="text-gray-400 text-sm">Cooldown: <span class="text-white font-mono">${b.remain}s</span></div>
+                                <div class="text-gray-400 text-sm">Cooldown: <span class="text-white font-mono">${b.permanent ? 'permanent' : b.remain + 's'}</span></div>
                             </div>
                         `;
                     });
