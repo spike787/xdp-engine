@@ -6,6 +6,9 @@
 #include <vector>
 #include <unordered_map>
 #include <functional>
+#include <mutex>
+#include <deque>
+#include <chrono>
 #include "rule_engine.h"
 #include "storage.h"
 
@@ -45,6 +48,15 @@ private:
     // Safety state
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_run_;
     std::deque<std::chrono::steady_clock::time_point> recent_blocks_;
+
+    // execute() is called concurrently from the SSH-watcher, HTTP-watcher,
+    // and XDP ring-buffer-poller threads (see engine.cpp's on_event), and it
+    // reads/writes last_run_ and recent_blocks_ with no synchronization of
+    // its own. This guards the whole body of execute() - it is distinct
+    // from approval_mutex_ (which only protects pending_approvals_, and is
+    // also taken from approve()/deny()/check_expiries(), none of which call
+    // back into execute(), so there is no lock-ordering cycle between them).
+    std::mutex exec_mutex_;
 
     // Approval state
     std::mutex approval_mutex_;

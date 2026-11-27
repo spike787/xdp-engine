@@ -634,8 +634,13 @@ int main(int argc, char** argv) {
         SshDetector detector{auth_log, on_event};
         std::jthread watcher{[&detector](std::stop_token st) { detector.run(st); }};
         
+        // HttpDetector's own constructor already starts its watch_loop() on an
+        // internal jthread (see HttpDetector::watcher_) - do not spawn a second
+        // one here. An earlier version of this code spawned an explicit thread
+        // at this call site too, which meant every HTTP access-log line was
+        // tailed and processed twice concurrently, by two separate LogTailer
+        // instances racing on the same file, doubling every HTTP-driven alert.
         HttpDetector http_detector{access_log, rule_engine, on_event};
-        std::jthread http_watcher{[&http_detector](std::stop_token st) { http_detector.watch_loop(st); }};
 
         auto handle_event = [](void* ctx, void* data, size_t size) -> int {
             if (size < sizeof(drop_event)) return 0;
@@ -798,6 +803,16 @@ int main(int argc, char** argv) {
                     }
                     else if (cmd == "unblock") { blocklist.unblock(*ip); out("ok"); }
                 } else out("invalid IPv4 address");
+            }
+            else if (cmd == "approve" || cmd == "deny") {
+                try {
+                    int id = std::stoi(arg);
+                    if (cmd == "approve") runner.approve(id);
+                    else runner.deny(id);
+                    out("ok");
+                } catch (...) {
+                    out("error: invalid approval id");
+                }
             } else if (!cmd.empty()) out("unknown command");
         };
 

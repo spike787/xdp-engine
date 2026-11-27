@@ -6,6 +6,7 @@
 #include <vector>
 #include <chrono>
 #include <deque>
+#include <mutex>
 #include <unordered_map>
 #include <yaml-cpp/yaml.h>
 #include <nlohmann/json.hpp>
@@ -68,13 +69,22 @@ private:
     using TimePoint = std::chrono::steady_clock::time_point;
     // rule_name -> (ip -> deque of timestamps)
     std::unordered_map<std::string, std::unordered_map<std::string, std::deque<TimePoint>>> windows_;
-    
+
     struct SeqState {
         std::size_t next_step_idx = 0;
         TimePoint start_time;
     };
     // rule_name -> (ip -> SeqState)
     std::unordered_map<std::string, std::unordered_map<std::string, SeqState>> seq_states_;
+
+    // process() is called concurrently from the SSH-watcher, HTTP-watcher,
+    // and XDP ring-buffer-poller threads (see engine.cpp's on_event). It
+    // mutates windows_/seq_states_ (insertion, erase, deque mutation), none
+    // of which is safe to do unsynchronized from multiple threads - this
+    // guards every call to process() with a single mutex. rules_ is only
+    // ever written in the constructor, before any of those threads start,
+    // so reading it in process() needs no lock.
+    std::mutex mutex_;
 };
 
 #endif // RULE_ENGINE_H

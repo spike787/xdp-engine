@@ -51,6 +51,7 @@ static bool is_valid_ip(const std::string& ip) {
 }
 
 std::vector<Alert> RuleEngine::process(const Event& e) {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<Alert> generated_alerts;
     
     // Strict IP validation
