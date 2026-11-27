@@ -1,6 +1,7 @@
 engine
 engine-cli
 local-api
+bouncer-xdp
 engine_asan
 test_logic
 *.o

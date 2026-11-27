@@ -11,7 +11,7 @@ ifneq ($(ARCH_INC),)
 BPF_CFLAGS += -I$(ARCH_INC)
 endif
 
-all: xdp_prog.bpf.o engine engine-cli local-api bench
+all: xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bench
 
 # Stage 1: C -> BPF bytecode inside an ELF object
 xdp_prog.bpf.o: xdp_prog.bpf.c
@@ -24,6 +24,13 @@ engine: engine.cpp rule_engine.cpp rule_engine.h storage.cpp storage.h playbook_
 engine-cli: engine-cli.cpp
 	$(CXX) -O2 -Wall -Wextra engine-cli.cpp -o $@
 
+# bouncer-xdp (ADR-0002): the enforcement component. Loads xdp_prog.bpf.c,
+# attaches it, pins the maps, and polls Local API's /decisions to keep
+# blocked_ips in sync. Needs libbpf (attach/pin) and libcurl (poll), not
+# yaml-cpp/sqlite3 - it has no rule engine or storage of its own.
+bouncer-xdp: bouncer_xdp.cpp bouncer_diff.h common.h
+	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread bouncer_xdp.cpp -o $@ -lbpf -lelf -lz -lcurl
+
 bench: tools/bench_flood.c
 	gcc -O3 -Wall -Wextra tools/bench_flood.c -o tools/bench_flood -pthread
 
@@ -34,10 +41,10 @@ local-api: local_api.cpp storage.cpp storage.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
 
 clean:
-	rm -f xdp_prog.bpf.o engine engine-cli local-api tools/bench_flood
+	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp tools/bench_flood
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp tests/test_storage.cpp rule_engine.cpp http_detector.cpp storage.cpp
+test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp rule_engine.cpp http_detector.cpp storage.cpp
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 

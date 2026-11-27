@@ -1,9 +1,9 @@
 // Local API: the shared control plane described in ROADMAP.md phase 1.
 //
-// Bouncers (currently: the XDP enforcement code inside engine.cpp; later:
-// standalone nftables/proxy bouncers) poll GET /decisions to learn which
-// IPs to block. GET /export gives the evidence/forensics dump requested
-// alongside it: alerts and raw events as CSV or JSON.
+// Bouncers (currently: bouncer-xdp, see docs/adr/0002-bouncer-xdp-separation.md;
+// later: standalone nftables/proxy bouncers) poll GET /decisions to learn
+// which IPs to block. GET /export gives the evidence/forensics dump
+// requested alongside it: alerts and raw events as CSV or JSON.
 //
 // This binary opens the SAME SQLite file the agent writes to (WAL mode,
 // safe for concurrent readers) rather than owning its own copy of the
