@@ -72,6 +72,7 @@ PlaybookRunner::PlaybookRunner(const std::string& yaml_path, const std::string& 
 }
 
 void PlaybookRunner::execute(Alert& alert) {
+    std::lock_guard<std::mutex> lock(exec_mutex_);
     auto it = playbooks_.find(alert.rule);
     if (it == playbooks_.end()) {
         return; // No playbook for this rule
