@@ -148,10 +148,15 @@ using RingBufPtr = std::unique_ptr<struct ring_buffer, RingBufDeleter>;
 
 class BlockList {
 public:
+    // ADR-0002: blocked_fd here is opened read-only in spirit (engine never
+    // writes to it anymore) - it's only used by print_blocked() to report
+    // whether bouncer-xdp has actually applied a decision yet. allowed_fd is
+    // still writable: the allowlist isn't an enforcement decision, it's a
+    // safety rail engine itself needs to consult before even proposing a
+    // block (see block() below), so engine keeps owning it.
     BlockList(int allowed_fd, int blocked_fd, int stats_fd, int proto_stats_fd, const std::unordered_set<std::uint32_t>& allow, Storage* storage = nullptr)
     : allowed_fd_{allowed_fd}, blocked_fd_{blocked_fd}, stats_fd_{stats_fd}, proto_stats_fd_{proto_stats_fd}, storage_{storage},
-      host_{[]{ char buf[256]; return gethostname(buf, sizeof(buf)) == 0 ? std::string(buf) : std::string("local"); }()},
-      sweeper_{[this](std::stop_token st) { sweep_loop(st); }} {
+      host_{[]{ char buf[256]; return gethostname(buf, sizeof(buf)) == 0 ? std::string(buf) : std::string("local"); }()} {
         for (std::uint32_t ip : allow) {
             allow_ip(ip);
         }
@@ -175,73 +180,64 @@ public:
         return (bpf_map_lookup_elem(allowed_fd_, &ip, &dummy) == 0);
     }
 
+    // ADR-0002: this no longer touches the kernel map directly. It only
+    // writes the decision to storage - bouncer-xdp picks it up on its next
+    // poll of GET /decisions and applies it. Actual enforcement therefore
+    // lags this call by up to bouncer-xdp's poll interval (default 2s).
     bool block(std::uint32_t ip, std::string_view reason, std::chrono::seconds duration = std::chrono::seconds(600), bool detect_only = false, bool manual = false) {
         if (detect_only) return false;
         if (is_allowed(ip)) {
             log_warn("refusing to block allow-listed " + ip_to_string(ip));
             return false;
         }
-        
-        struct block_record rec{};
-        rec.hits = 0;
-        if (duration.count() > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            rec.expires_at_ns = (ts.tv_sec * 1000000000ULL + ts.tv_nsec) + (duration.count() * 1000000000ULL);
-        } else {
-            rec.expires_at_ns = 0;
-        }
-
-        if (!map_update(blocked_fd_, ip, rec)) {
-            log_warn(std::string{"[error] map update failed: "} + std::strerror(errno));
+        if (!storage_) {
+            log_warn("no storage attached - cannot persist block decision for " + ip_to_string(ip));
             return false;
         }
-        std::string label = manual ? "manual" : "automatic";
-        print_log("[BLOCKED]", ip_to_string(ip) + " ttl=" + std::to_string(duration.count()) + "s " + label, "\x1b[31m");
 
-        // Persist the decision so the Local API can serve it to bouncers
-        // independent of this process's lifetime (ROADMAP.md phase 1).
-        if (storage_) {
-            long long expires_unix = (duration.count() > 0)
-                ? static_cast<long long>(std::time(nullptr)) + duration.count()
-                : 0;
-            storage_->insert_decision({ip_to_string(ip), "block", std::string(reason), std::string(reason), expires_unix, static_cast<int>(duration.count()), host_});
-        }
+        std::string label = manual ? "manual" : "automatic";
+        print_log("[BLOCKED]", ip_to_string(ip) + " ttl=" + std::to_string(duration.count()) + "s " + label +
+                   " (decision recorded, bouncer-xdp will enforce)", "\x1b[31m");
+
+        long long expires_unix = (duration.count() > 0)
+            ? static_cast<long long>(std::time(nullptr)) + duration.count()
+            : 0;
+        storage_->insert_decision({ip_to_string(ip), "block", std::string(reason), std::string(reason), expires_unix, static_cast<int>(duration.count()), host_});
         return true;
     }
 
     void unblock(std::uint32_t ip) {
-        if (bpf_map_delete_elem(blocked_fd_, &ip) == 0) {
-            print_log("[EXPIRED]", ip_to_string(ip) + " (manual unblock)");
-            if (storage_) {
-                storage_->insert_decision({ip_to_string(ip), "unblock", "manual unblock", "", 0, 0, host_});
-            }
+        print_log("[RELEASE]", ip_to_string(ip) + " (manual unblock, decision recorded)");
+        if (storage_) {
+            storage_->insert_decision({ip_to_string(ip), "unblock", "manual unblock", "", 0, 0, host_});
         }
     }
 
+    // ADR-0002: the authoritative "should this IP be blocked" answer now
+    // lives in storage's decisions, not the kernel map (bouncer-xdp owns
+    // that and only mirrors it there). This reads the decisions and, for
+    // each, does a read-only lookup against the pinned blocked_ips map to
+    // show whether bouncer-xdp has actually caught up yet.
     void print_blocked(std::function<void(const std::string&)> out) {
-        std::uint32_t key = 0, next_key;
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        std::uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        if (!storage_) { out("Active Blocks: <storage unavailable>"); return; }
+        auto decisions = storage_->get_active_decisions();
+        long long now_unix = static_cast<long long>(std::time(nullptr));
 
-        out("Active Blocks:");
-        bool any = false;
-        while (bpf_map_get_next_key(blocked_fd_, &key, &next_key) == 0) {
-            struct block_record rec;
-            if (bpf_map_lookup_elem(blocked_fd_, &next_key, &rec) == 0) {
-                if (rec.expires_at_ns > 0 && rec.expires_at_ns <= now_ns) {
-                    key = next_key;
-                    continue; // expired
-                }
-                std::string exp = (rec.expires_at_ns == 0) ? "permanent" : 
-                    std::to_string((rec.expires_at_ns - now_ns) / 1000000000) + "s left";
-                out("  " + ip_to_string(next_key) + " (hits: " + std::to_string(rec.hits) + ", " + exp + ")");
-                any = true;
+        out("Active Blocks (decisions; bouncer-xdp enforces within its poll interval):");
+        if (decisions.empty()) { out("  <none>"); return; }
+
+        for (const auto& d : decisions) {
+            long long left = d.expires_at_unix - now_unix;
+            if (left < 0) left = 0;
+            std::string exp = (d.expires_at_unix == 0) ? "permanent" : std::to_string(left) + "s left";
+
+            std::string enforced = "[pending]";
+            if (auto ip = parse_ipv4_local(d.ip)) {
+                struct block_record rec;
+                if (bpf_map_lookup_elem(blocked_fd_, &*ip, &rec) == 0) enforced = "[enforced]";
             }
-            key = next_key;
+            out("  " + d.ip + " (" + exp + ", " + d.reason + ") " + enforced);
         }
-        if (!any) out("  <none>");
     }
 
     std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t> get_stats() {
@@ -275,34 +271,11 @@ public:
     }
 
 private:
-    void sweep_loop(std::stop_token st) {
-        while (!st.stop_requested()) {
-            std::this_thread::sleep_for(2s);
-            
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            std::uint64_t now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-
-            std::vector<std::uint32_t> to_delete;
-            std::uint32_t key = 0, next_key;
-            
-            while (bpf_map_get_next_key(blocked_fd_, &key, &next_key) == 0) {
-                struct block_record rec;
-                if (bpf_map_lookup_elem(blocked_fd_, &next_key, &rec) == 0) {
-                    if (rec.expires_at_ns > 0 && rec.expires_at_ns <= now_ns) {
-                        to_delete.push_back(next_key);
-                    }
-                }
-                key = next_key;
-            }
-            
-            for (auto k : to_delete) {
-                if (bpf_map_delete_elem(blocked_fd_, &k) == 0) {
-                    print_log("[EXPIRED]", ip_to_string(k) + " (ttl elapsed)");
-                }
-            }
-        }
-    }
+    // No sweep_loop anymore: expiry is decided by the Local API's SQL query
+    // (get_active_decisions filters to non-expired rows) and enforced by
+    // bouncer-xdp simply no longer finding an expired IP in the next poll's
+    // result set, so it deletes it from blocked_ips itself. Nothing in this
+    // process needs to touch the kernel map's expiry on a timer anymore.
 
     int allowed_fd_;
     int blocked_fd_;
@@ -310,45 +283,36 @@ private:
     int proto_stats_fd_;
     Storage* storage_;
     std::string host_;
-    std::jthread sweeper_;
 };
 
 class XdpEngine {
 public:
-    XdpEngine(const std::string& obj_path, const std::string& ifname) : ifname_{ifname} {
+    // ADR-0002: engine no longer loads xdp_prog.bpf.c or attaches it itself.
+    // bouncer-xdp owns the attach and pins every map it defines under
+    // XDP_ENGINE_PIN_DIR; engine just opens what it needs from there. This
+    // means bouncer-xdp must be started (on this interface) before engine -
+    // see README.md.
+    XdpEngine(const std::string& /*obj_path*/, const std::string& ifname) : ifname_{ifname} {
         const unsigned ifindex = if_nametoindex(ifname.c_str());
         if (ifindex == 0) throw std::runtime_error("no such interface: " + ifname);
 
-        obj_.reset(bpf_object__open_file(obj_path.c_str(), nullptr));
-        if (!obj_) throw std::runtime_error("open failed: " + std::string{std::strerror(errno)});
+        auto open_pinned = [](const char* name) {
+            std::string path = std::string(XDP_ENGINE_PIN_DIR) + "/" + name;
+            return bpf_obj_get(path.c_str());
+        };
 
-        bpf_map* allowed  = bpf_object__find_map_by_name(obj_.get(), "allowed_ips");
-        bpf_map* blocked  = bpf_object__find_map_by_name(obj_.get(), "blocked_ips");
-        if (!allowed || !blocked) throw std::runtime_error("missing map in object");
+        allowed_fd_ = open_pinned("allowed_ips");
+        blocked_fd_ = open_pinned("blocked_ips");
+        if (allowed_fd_ < 0 || blocked_fd_ < 0) {
+            throw std::runtime_error(
+                "could not open pinned maps under " + std::string(XDP_ENGINE_PIN_DIR) +
+                " - is bouncer-xdp running on " + ifname + "? Start it first: sudo ./bouncer-xdp " + ifname);
+        }
 
-        if (int err = bpf_object__load(obj_.get()))
-            throw std::runtime_error("load failed: " + std::string{std::strerror(-err)});
-
-        bpf_program* prog = bpf_object__find_program_by_name(obj_.get(), "xdp_firewall");
-        if (!prog) throw std::runtime_error("program xdp_firewall not found");
-
-        link_.reset(bpf_program__attach_xdp(prog, ifindex));
-        if (!link_) throw std::runtime_error("attach failed: " + std::string{std::strerror(errno)});
-
-        allowed_fd_ = bpf_map__fd(allowed);
-        blocked_fd_ = bpf_map__fd(blocked);
-        
-        bpf_map* stats = bpf_object__find_map_by_name(obj_.get(), "stats");
-        stats_fd_ = stats ? bpf_map__fd(stats) : -1;
-        
-        bpf_map* events = bpf_object__find_map_by_name(obj_.get(), "events");
-        events_fd_ = events ? bpf_map__fd(events) : -1;
-
-        bpf_map* limits = bpf_object__find_map_by_name(obj_.get(), "limits");
-        limits_fd_ = limits ? bpf_map__fd(limits) : -1;
-
-        bpf_map* pstats = bpf_object__find_map_by_name(obj_.get(), "proto_stats");
-        proto_stats_fd_ = pstats ? bpf_map__fd(pstats) : -1;
+        stats_fd_       = open_pinned("stats");
+        events_fd_      = open_pinned("events");
+        limits_fd_      = open_pinned("limits");
+        proto_stats_fd_ = open_pinned("proto_stats");
 
         set_limit(200);
     }
@@ -374,16 +338,10 @@ public:
     }
 
 private:
-    struct BpfObjDeleter {
-        void operator()(struct bpf_object* obj) const { bpf_object__close(obj); }
-    };
-    struct BpfLinkDeleter {
-        void operator()(struct bpf_link* link) const { bpf_link__destroy(link); }
-    };
-    
     std::string ifname_;
-    std::unique_ptr<struct bpf_object, BpfObjDeleter> obj_;
-    std::unique_ptr<struct bpf_link, BpfLinkDeleter> link_;
+    // No bpf_object/bpf_link members anymore: all fds below come from
+    // bpf_obj_get() on bouncer-xdp's pins, which outlive this process
+    // regardless of whether engine holds them open.
     int allowed_fd_{-1}, blocked_fd_{-1}, stats_fd_{-1}, events_fd_{-1}, limits_fd_{-1}, proto_stats_fd_{-1};
     int limit_{200};
 };
@@ -434,34 +392,18 @@ int main(int argc, char** argv) {
     std::string cmd_or_iface = argv[1];
 
     if (cmd_or_iface == "cleanup") {
-        if (argc < 3) {
-            std::cerr << "Usage: sudo " << argv[0] << " cleanup <iface>\n";
-            return 1;
-        }
-        std::string iface = argv[2];
-        unsigned int ifindex = if_nametoindex(iface.c_str());
-        if (ifindex == 0) {
-            std::cerr << "Interface " << iface << " not found.\n";
-            return 1;
-        }
-        __u32 prog_id = 0;
-        if (bpf_xdp_query_id(ifindex, 0, &prog_id) == 0 && prog_id > 0) {
-            DECLARE_LIBBPF_OPTS(bpf_xdp_attach_opts, attach_opts);
-            if (bpf_xdp_detach(ifindex, 0, &attach_opts) == 0) {
-                std::cout << "Detached XDP program (ID: " << prog_id << ") from " << iface << "\n";
-            } else {
-                std::cerr << "Failed to detach XDP program.\n";
-                return 1;
-            }
-        } else {
-            std::cout << "No XDP program attached to " << iface << ".\n";
-        }
-        return 0;
+        // ADR-0002: engine no longer loads/attaches the XDP program - bouncer-xdp
+        // does, and owns detaching it too.
+        std::cerr << "engine no longer attaches the XDP program (see docs/adr/0002-bouncer-xdp-separation.md).\n";
+        std::cerr << "Use: sudo ./bouncer-xdp cleanup " << (argc >= 3 ? argv[2] : "<iface>") << "\n";
+        return 1;
     }
 
     if (cmd_or_iface == "reset") {
-        std::filesystem::remove_all("/sys/fs/bpf/xdp_engine");
-        std::cout << "Removed pinned maps from /sys/fs/bpf/xdp_engine\n";
+        // Only engine's own control socket is engine's to clean up now; the
+        // pinned maps/link under XDP_ENGINE_PIN_DIR belong to bouncer-xdp.
+        std::cout << "Note: pinned maps/link are owned by bouncer-xdp now - use "
+                     "'sudo ./bouncer-xdp cleanup <iface>' to remove those.\n";
         unlink("/run/xdp_engine.sock");
         // Database renaming removed; history is wiped inside instead.
         return 0;

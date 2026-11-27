@@ -23,4 +23,13 @@ struct drop_event {
 #define REASON_PORTSCAN  2
 #define REASON_ICMP      3
 
+/*
+ * bouncer-xdp owns loading/attaching xdp_prog.bpf.c and pins every map it
+ * defines under this bpffs directory, one file per map (named after the
+ * map). engine (and any future bouncer/tool) opens the maps it needs from
+ * here with bpf_obj_get() instead of loading the BPF object itself. See
+ * docs/adr/0002-bouncer-xdp-separation.md.
+ */
+#define XDP_ENGINE_PIN_DIR "/sys/fs/bpf/xdp_engine"
+
 #endif

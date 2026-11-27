@@ -18,17 +18,19 @@ Filters millions of malicious packets per second in Linux kernel space at driver
    - [Step 1: Clone the Repository](#step-1-clone-the-repository)
    - [Step 2: Build the Engine](#step-2-build-the-engine)
    - [Step 3: Launch the Web Dashboard](#step-3-launch-the-web-dashboard)
-   - [Step 4: Launch the XDP Engine](#step-4-launch-the-xdp-engine)
+   - [Step 4: Launch Enforcement, the Local API, and the Engine](#step-4-launch-enforcement-the-local-api-and-the-engine-in-that-order)
 5. [Interactive Console Commands](#-interactive-console-commands)
-6. [Live Showcase Dashboard](#-live-showcase-dashboard)
-7. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+6. [Local API (decisions + export)](#-local-api-decisions--export)
+7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
+8. [Live Showcase Dashboard](#-live-showcase-dashboard)
+9. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
    - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
    - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
    - [Test 3: Network Port Scanning](#3-network-port-scanning)
    - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
    - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-8. [Configuration Files](#-configuration-files)
-9. [Troubleshooting & FAQ](#-troubleshooting--faq)
+10. [Configuration Files](#-configuration-files)
+11. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -113,14 +115,31 @@ Open your browser to:
 
 *(While the engine is not yet started, the top-right badge cleanly pulses **`Loading Mode...`** in Standby).*
 
-### Step 4: Launch the XDP Engine
-Open a **second terminal window** in the project directory:
+### Step 4: Launch Enforcement, the Local API, and the Engine (in that order)
+
+Since [ADR-0002](docs/adr/0002-bouncer-xdp-separation.md), detection and
+enforcement are separate binaries, and **startup order matters**:
+`bouncer-xdp` must be running on an interface before `engine` will start
+on it, because `engine` opens maps that only exist once `bouncer-xdp` has
+pinned them.
 
 1. Identify your active network interface (e.g. `wlp8s0` for Wi-Fi or `eth0` / `enp3s0` for Ethernet):
    ```bash
    ip route get 1.1.1.1 | awk '{print $5; exit}'
    ```
-2. Start the engine (replace `wlp8s0` with your interface name):
+2. **Terminal 2 — enforcement** (replace `wlp8s0` with your interface name):
+   ```bash
+   sudo ./bouncer-xdp wlp8s0
+   ```
+   This loads `xdp_prog.bpf.c`, attaches it, and pins every map under
+   `/sys/fs/bpf/xdp_engine/`. Leave it running — see the
+   [bouncer-xdp](#-bouncer-xdp-enforcement) section below for what it's
+   actually doing and how to clean it up.
+3. **Terminal 3 — Local API** (so bouncer-xdp has decisions to poll):
+   ```bash
+   LOCAL_API_TOKEN=your-secret ./local-api engine.db 8088
+   ```
+4. **Terminal 4 — the engine itself**:
    ```bash
    sudo ./engine wlp8s0
    ```
@@ -128,8 +147,15 @@ Open a **second terminal window** in the project directory:
    ```bash
    sudo ./engine wlp8s0 --enforce
    ```
+   If this fails with "could not open pinned maps", `bouncer-xdp` isn't
+   running on this interface yet — go back to step 2.
 
 Within 1 second, the dashboard badge will light up in **`DETECT MODE`** (Blue) or **`ENFORCE MODE`** (Red)!
+
+A block decided by the rule engine or by `block <IP>` below now takes
+effect once `bouncer-xdp` applies it on its next poll (default every 2s),
+not instantly — `list` shows `[pending]` vs `[enforced]` so you can see
+exactly where a given IP is in that pipeline.
 
 ---
 
@@ -142,14 +168,14 @@ While `./engine` is running, you can type commands directly into its terminal:
 | `mode enforce` *(or `enforce`)* | Instantly switches the firewall to **Active Kernel Blocking** (Dashboard turns **RED**). | `mode enforce` |
 | `mode detect` *(or `detect`)* | Switches to **Passive Detection Mode** without dropping packets (Dashboard turns **BLUE**). | `mode detect` |
 | `mode show` *(or `mode`)* | Prints the current operating mode. | `mode` |
-| `block <IP> [TTL]` | Manually inserts an IP into the kernel drop table with optional expiry (default: 600s). | `block 192.168.1.100 300` |
-| `unblock <IP>` | Removes an IP from the kernel drop table immediately. | `unblock 192.168.1.100` |
+| `block <IP> [TTL]` | Records a block decision with optional expiry (default: 600s). `bouncer-xdp` applies it to the kernel on its next poll — see Step 4. | `block 192.168.1.100 300` |
+| `unblock <IP>` | Records an unblock decision; `bouncer-xdp` removes the kernel entry on its next poll. | `unblock 192.168.1.100` |
 | `allow <IP>` | Whitelists an IP so it will never be banned. | `allow 192.168.1.50` |
 | `unallow <IP>` | Removes an IP from the whitelist. | `unallow 192.168.1.50` |
-| `list` | Displays all currently banned IPs, hit counters, and remaining ban times. | `list` |
+| `list` | Displays every active block decision, its remaining TTL, and whether `bouncer-xdp` has enforced it yet (`[enforced]`/`[pending]`). | `list` |
 | `stats` | Prints real-time packet counters: dropped, passed, TCP, UDP, and ICMP. | `stats` |
 | `alerts` | Prints the 10 most recent security alerts. | `alerts` |
-| `quit` | Detaches the XDP program cleanly, marks status `OFFLINE`, and exits. | `quit` |
+| `quit` | Marks status `OFFLINE` and exits. Enforcement is unaffected — `bouncer-xdp` keeps running and keeps applying decisions independently. | `quit` |
 
 ---
 
@@ -180,6 +206,35 @@ reachable beyond localhost.
 curl -H "Authorization: Bearer your-secret" \
   "http://127.0.0.1:8088/export?type=alerts&format=csv" -o alerts.csv
 ```
+
+---
+
+## 🛡️ bouncer-xdp (enforcement)
+
+`bouncer-xdp` is the only binary that ever loads `xdp_prog.bpf.c` and
+attaches it to a NIC (see [ADR-0002](docs/adr/0002-bouncer-xdp-separation.md)).
+It has no rule engine and no database of its own — it just polls Local
+API's `GET /decisions` and reconciles the kernel's `blocked_ips` map to
+match, exactly like a CrowdSec remediation component.
+
+```bash
+sudo ./bouncer-xdp wlp8s0
+# or, with non-default Local API settings:
+sudo ./bouncer-xdp wlp8s0 --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
+```
+
+On first attach it pins every map plus the XDP link itself under
+`/sys/fs/bpf/xdp_engine/`. That means **restarting `bouncer-xdp` does not
+drop enforcement** — on startup it notices the existing pins and just
+resumes polling against the already-attached program instead of
+re-attaching. To actually detach and remove the pins:
+
+```bash
+sudo ./bouncer-xdp cleanup wlp8s0
+```
+
+`LOCAL_API_TOKEN` is read from the environment the same way `local-api`
+reads it; `--lapi-token` overrides it.
 
 ---
 
@@ -256,18 +311,25 @@ sudo hping3 -S -p 80 --flood --rand-source <SERVER_IP>
    ```bash
    ./tools/setup_veth_lab.sh start
    ```
-2. **Start the Engine on the Virtual Interface (Terminal 1):**
+2. **Start enforcement, Local API, and the engine on the virtual interface**
+   (three terminals, in this order — see [Step 4](#step-4-launch-enforcement-the-local-api-and-the-engine-in-that-order)):
    ```bash
+   sudo ./bouncer-xdp veth-bench
+   LOCAL_API_TOKEN=your-secret ./local-api engine.db 8088
    sudo ./engine veth-bench --enforce
    ```
-   *Type `block 198.51.100.2` in the engine console.*
-3. **Launch the Multi-Thread Batch Generator (Terminal 2):**
+   *Type `block 198.51.100.2` in the engine console, then `list` — wait*
+   *for it to show `[enforced]` (bouncer-xdp's next poll, ≤2s) before*
+   *starting the flood below, or the first couple seconds of packets will*
+   *pass through before enforcement catches up.*
+3. **Launch the Multi-Thread Batch Generator (another terminal):**
    ```bash
    sudo ./tools/bench_flood 198.51.100.1 198.51.100.2 4 veth-gen 80
    ```
    *Watch the live showcase dashboard at `http://127.0.0.1:5000/?showcase=1` instantly display **1.5M - 2.0M+ drops/sec**!*
 4. **Clean up when finished:**
    ```bash
+   sudo ./bouncer-xdp cleanup veth-bench
    ./tools/setup_veth_lab.sh stop
    ```
 
@@ -289,10 +351,13 @@ sudo hping3 -S -p 80 --flood --rand-source <SERVER_IP>
 * Ensure both the engine and dashboard are run from the project root (`~/xdp-engine`).
 
 **Q: "open failed: Permission denied"?**  
-* eBPF operations require root privileges. Always execute `./engine` using `sudo`.
+* eBPF operations require root privileges. Always execute `./bouncer-xdp` and `./engine` using `sudo`.
 
-**Q: How do I cleanly detach XDP if the engine crashed?**  
-* Run: `sudo ip link set dev <INTERFACE> xdp off`
+**Q: `engine` won't start — "could not open pinned maps under /sys/fs/bpf/xdp_engine"?**  
+* `bouncer-xdp` isn't running on that interface yet (see [Step 4](#step-4-launch-enforcement-the-local-api-and-the-engine-in-that-order)) — `engine` no longer attaches XDP itself since [ADR-0002](docs/adr/0002-bouncer-xdp-separation.md), it just opens the maps `bouncer-xdp` pinned. Start `bouncer-xdp <INTERFACE>` first.
+
+**Q: How do I cleanly detach XDP if `bouncer-xdp` crashed?**  
+* A crash alone doesn't detach anything — that's the point of pinning (enforcement survives it). Run `sudo ./bouncer-xdp cleanup <INTERFACE>` to actually detach and remove the pins. If that binary is unavailable for some reason, the raw escape hatch is `sudo ip link set dev <INTERFACE> xdp off` plus `sudo rm -rf /sys/fs/bpf/xdp_engine`.
 
 ---
 
