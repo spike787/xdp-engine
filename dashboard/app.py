@@ -119,14 +119,15 @@ def api_drops_per_sec():
     db = get_db()
     now = int(time.time())
     cutoff = now - 300
-    rows = db.execute("SELECT ts, dropped FROM metrics WHERE ts > ? ORDER BY ts", (cutoff,)).fetchall()
+    rows = db.execute("SELECT ts, MAX(dropped) as dropped FROM metrics WHERE ts > ? GROUP BY ts ORDER BY ts", (cutoff,)).fetchall()
     
     data = []
     for i in range(1, len(rows)):
-        dt = rows[i]['ts'] - rows[i-1]['ts']
+        # Calculate over a rolling 3-sample window to smooth bursty packet delivery
+        window_start = max(0, i - 3)
+        dt = rows[i]['ts'] - rows[window_start]['ts']
         if dt > 0:
-            d_dropped = rows[i]['dropped'] - rows[i-1]['dropped']
-            # handle counter wraps if any (unlikely for 64-bit but good practice)
+            d_dropped = rows[i]['dropped'] - rows[window_start]['dropped']
             if d_dropped < 0: d_dropped = 0
             pps = d_dropped / dt
             data.append({"ts": rows[i]['ts'], "pps": round(pps, 2)})
@@ -241,5 +242,5 @@ def api_timeline():
     return jsonify([dict(r) for r in rows])
 
 if __name__ == '__main__':
-    # Bind to 127.0.0.1:5000, no debug mode
-    app.run(host='127.0.0.1', port=5000, debug=False)
+    # Bind to 0.0.0.0:5000 so both local and LAN devices can view dashboard
+    app.run(host='0.0.0.0', port=5000, debug=False)
