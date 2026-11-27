@@ -146,3 +146,32 @@ TEST(StorageExportTest, EventsExportIncludesHostColumn) {
 
     std::filesystem::remove(path);
 }
+
+// SshDetector accepts any non-whitespace string as the attempted username
+// (engine.cpp's regex is `(\S+)`), so events.user can contain a value an
+// attacker fully controls, such as a formula-injection payload. CSV export
+// must neutralize that rather than passing it through to a spreadsheet.
+TEST(StorageExportTest, CsvExportNeutralizesFormulaInjectionInUserField) {
+    auto path = fresh_db_path();
+    std::filesystem::remove(path);
+    Storage storage(path);
+
+    Event e;
+    e.ts_iso = "2026-11-27T00:00:00Z";
+    e.source = "ssh_log";
+    e.type = "ssh_failed";
+    e.src_ip = "10.0.0.9";
+    e.user = "=HYPERLINK(\"http://evil/\",\"x\")";
+    e.severity = 3;
+    storage.insert_event(e);
+
+    auto csv_str = storage.export_events("csv", "", "");
+    // The raw payload must never appear un-neutralized: a leading '='
+    // would be evaluated as a formula by Excel/LibreOffice/Sheets.
+    EXPECT_EQ(csv_str.find("\"=HYPERLINK"), std::string::npos);
+    // The mitigation (a leading single quote) should be present instead,
+    // with the field still present and still comma/quote-escaped.
+    EXPECT_NE(csv_str.find("'=HYPERLINK"), std::string::npos);
+
+    std::filesystem::remove(path);
+}

@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <curl/curl.h>
+#include <nlohmann/json.hpp>
 
 Notifier::Notifier() {
     const char* env_url = std::getenv("NOTIFY_WEBHOOK_URL");
@@ -37,8 +38,14 @@ void Notifier::notify(const Alert& alert) {
                        " (Severity: " + alert.severity + "). " +
                        "Action: block for " + std::to_string(alert.block_seconds) + " seconds.";
                        
-    // Simple JSON payload for typical webhooks (Slack/Mattermost format)
-    std::string payload = "{\"text\": \"" + text + "\"}";
+    // Simple JSON payload for typical webhooks (Slack/Mattermost format).
+    // Built with nlohmann::json rather than raw string concatenation so
+    // quotes/backslashes/control characters in `text` are escaped
+    // correctly - today every field going into `text` is validated
+    // (rule/severity/mitre come from rules.yaml, src_ip is IPv4-checked),
+    // but hand-rolled "{\"text\": \"" + text + "\"}"-style concatenation
+    // is fragile against any future field that isn't similarly validated.
+    std::string payload = nlohmann::json{{"text", text}}.dump();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
