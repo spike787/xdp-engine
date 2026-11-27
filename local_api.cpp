@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Local API: the shared control plane described in ROADMAP.md phase 1.
 //
 // Bouncers (currently: bouncer-xdp, see docs/adr/0002-bouncer-xdp-separation.md;

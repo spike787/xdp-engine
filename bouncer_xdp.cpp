@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // bouncer-xdp.cpp - the enforcement component (ADR-0002).
 //
 // This is the only process that loads xdp_prog.bpf.c, attaches it to a

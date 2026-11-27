@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef NOTIFIER_H
 #define NOTIFIER_H
 

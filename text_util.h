@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef TEXT_UTIL_H
 #define TEXT_UTIL_H
 

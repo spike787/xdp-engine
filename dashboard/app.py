@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 import sqlite3
 import os
 from flask import Flask, render_template, jsonify, g, request

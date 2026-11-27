@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
 # setup_veth_lab.sh - Single-Laptop Virtual Attacker Lab (Network Namespace + veth pair)
 # Allows running ALL attacks (SQLi, Path Traversal, SSH Brute-Force, Port Scan, Killshot, and 2M PPS Flood)
 # from a single laptop without needing a second machine or Wi-Fi!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "notifier.h"
 #include <cstdlib>
 #include <iostream>

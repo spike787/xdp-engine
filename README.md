@@ -362,4 +362,9 @@ sudo hping3 -S -p 80 --flood --rand-source <SERVER_IP>
 ---
 
 ## 📄 License
-This project is open-source under the [MIT License](LICENSE).
+This project is open-source under the [MIT License](LICENSE), with one
+exception: `xdp_prog.bpf.c` is licensed under [GPL-2.0](LICENSE-GPL-2.0)
+instead, because it uses Linux kernel eBPF helpers that the kernel's BPF
+verifier only allows GPL-licensed programs to call. Each source file's own
+`SPDX-License-Identifier` header is the authoritative marker for which
+license applies to it.

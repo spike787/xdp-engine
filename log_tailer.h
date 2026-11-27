@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef LOG_TAILER_H
 #define LOG_TAILER_H
 

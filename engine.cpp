@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include <iostream>
 #include <string>
 #include <vector>
@@ -86,7 +87,14 @@ std::optional<std::uint32_t> parse_ipv4_local(const std::string& text) {
 
 void add_iface_ips(std::unordered_set<std::uint32_t>& allow, const std::string& ifname) {
     struct ifaddrs *ifaddr, *ifa;
-    if (getifaddrs(&ifaddr) == -1) return;
+    if (getifaddrs(&ifaddr) == -1) {
+        // Silent failure here means the engine's own interface IP never gets
+        // auto-allowlisted, which can look like an unexplained self-lockout
+        // later - worth a log line even though getifaddrs rarely fails.
+        log_warn("getifaddrs() failed: " + std::string(std::strerror(errno)) +
+                  " - this interface's own IP will not be auto-allowlisted");
+        return;
+    }
     for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == nullptr) continue;
         if (ifa->ifa_addr->sa_family == AF_INET && std::string(ifa->ifa_name) == ifname) {
@@ -117,7 +125,10 @@ void add_gateway_ips(std::unordered_set<std::uint32_t>& allow) {
 
 bool check_process(const std::string& name) {
     DIR* dir = opendir("/proc");
-    if (!dir) return false;
+    if (!dir) {
+        log_warn("opendir(/proc) failed: " + std::string(std::strerror(errno)));
+        return false;
+    }
     struct dirent* ent;
     while ((ent = readdir(dir)) != nullptr) {
         if (ent->d_type == DT_DIR && std::isdigit(ent->d_name[0])) {

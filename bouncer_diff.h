@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // bouncer_diff.h - pure decision-reconciliation logic for bouncer-xdp.
 //
 // Factored out of bouncer-xdp.cpp so it can be unit tested without a real

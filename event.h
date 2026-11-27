@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef EVENT_H
 #define EVENT_H
 

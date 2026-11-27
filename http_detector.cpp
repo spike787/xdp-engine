@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "http_detector.h"
 #include <fstream>
 #include <iostream>

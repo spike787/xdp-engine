@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Unit tests for bouncer-xdp's decision-reconciliation logic. These touch
 // no BPF syscalls and no network - bouncer_diff.h is pure by design so this
 // can run in regular CI alongside the rest of the suite.

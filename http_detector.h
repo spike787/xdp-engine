@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef HTTP_DETECTOR_H
 #define HTTP_DETECTOR_H
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #ifndef STORAGE_H
 #define STORAGE_H
 

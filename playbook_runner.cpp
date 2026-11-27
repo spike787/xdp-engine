@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "playbook_runner.h"
 #include <yaml-cpp/yaml.h>
 #include <fstream>
