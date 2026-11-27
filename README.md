@@ -242,9 +242,34 @@ Demonstrates line-rate kernel packet dropping:
 # High-speed TCP SYN flood:
 sudo hping3 -S -p 80 --flood <SERVER_IP>
 
+# Multi-process parallel flood (higher PPS across multiple CPU cores):
+for i in {1..8}; do sudo hping3 -S -p 80 --flood <SERVER_IP> & done
+
 # Random IP spoofed botnet flood (tests 1,000,000 IP hash map capacity):
 sudo hping3 -S -p 80 --flood --rand-source <SERVER_IP>
 ```
+
+### 6. High-Speed 1-2 Million Drops/Sec Benchmark
+*(Note: Physical Wi-Fi radio channels are physically capped around 30k–80k frames/sec due to 802.11 airtime and ACK overhead. To demonstrate XDP's full **1,000,000 to 2,000,000+ packets/sec** capability, use the in-memory virtual lab):*
+
+1. **Start the Virtual Lab Interface:**
+   ```bash
+   ./tools/setup_veth_lab.sh start
+   ```
+2. **Start the Engine on the Virtual Interface (Terminal 1):**
+   ```bash
+   sudo ./engine veth-bench --enforce
+   ```
+   *Type `block 198.51.100.2` in the engine console.*
+3. **Launch the Multi-Thread Batch Generator (Terminal 2):**
+   ```bash
+   sudo ./tools/bench_flood 198.51.100.1 198.51.100.2 4 veth-gen 80
+   ```
+   *Watch the live showcase dashboard at `http://127.0.0.1:5000/?showcase=1` instantly display **1.5M - 2.0M+ drops/sec**!*
+4. **Clean up when finished:**
+   ```bash
+   ./tools/setup_veth_lab.sh stop
+   ```
 
 ---
 

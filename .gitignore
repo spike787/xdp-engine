@@ -9,3 +9,6 @@ test_logic
 engine.db*
 __pycache__/
 
+report.md
+hydra.restore
+tools/bench_flood

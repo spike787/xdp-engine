@@ -60,6 +60,8 @@ Storage::Storage(const std::string& db_path) {
 void Storage::exec_schema() {
     const char* schema = R"(
         PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT, source TEXT, type TEXT, src_ip TEXT, user TEXT, severity INTEGER

@@ -687,6 +687,16 @@ int main(int argc, char** argv) {
         auto handle_event = [](void* ctx, void* data, size_t size) -> int {
             if (size < sizeof(drop_event)) return 0;
             auto* d = static_cast<const drop_event*>(data);
+            if (d->reason == REASON_BLOCKLIST || d->reason == REASON_RATELIMIT) {
+                static std::unordered_map<uint64_t, uint64_t> last_emit_ns;
+                uint64_t key = (static_cast<uint64_t>(d->src_ip) << 32) | d->reason;
+                auto it = last_emit_ns.find(key);
+                if (it != last_emit_ns.end() && d->ts_ns >= it->second && (d->ts_ns - it->second) < 2000000000ULL) {
+                    return 0;
+                }
+                if (last_emit_ns.size() > 10000) last_emit_ns.clear();
+                last_emit_ns[key] = d->ts_ns;
+            }
             auto* on_event_ptr = static_cast<EventCallback*>(ctx);
             Event e;
             e.ts_iso = get_iso_time_str();
@@ -728,7 +738,7 @@ int main(int argc, char** argv) {
         std::jthread metrics_poller{[&](std::stop_token st) {
             while (!st.stop_requested()) {
                 std::mutex m; std::unique_lock lk(m);
-                if (std::condition_variable_any().wait_for(lk, st, 2s, []{return false;})) {
+                if (std::condition_variable_any().wait_for(lk, st, 1s, []{return false;})) {
                     break;
                 }
                 
@@ -739,11 +749,18 @@ int main(int argc, char** argv) {
                 std::string xdp_mode = get_xdp_mode(engine.get_ifname());
                 storage.insert_metrics(ts.tv_sec, dropped, passed, tcp, udp, icmp, other, engine.get_limit(), enforce_mode ? "ENFORCE" : "DETECT");
                 
-                if (dropped > last_dropped) {
-                    uint64_t rate = (dropped - last_dropped) / 2;
-                    print_log("[DROPPING]", "total=" + std::to_string(dropped) + " rate=" + std::to_string(rate) + "/s", "\x1b[31m");
-                    last_dropped = dropped;
+                uint64_t delta = (dropped >= last_dropped) ? (dropped - last_dropped) : 0;
+                if (delta > 0) {
+                    std::string rate_str = std::to_string(delta) + "/s";
+                    if (delta >= 1'000'000) {
+                        double m = static_cast<double>(delta) / 1'000'000.0;
+                        char buf[32];
+                        std::snprintf(buf, sizeof(buf), " (%.2fM/s)", m);
+                        rate_str += buf;
+                    }
+                    print_log("[DROPPING]", "total=" + std::to_string(dropped) + " rate=" + rate_str, "\x1b[31m");
                 }
+                last_dropped = dropped;
             }
         }};
 

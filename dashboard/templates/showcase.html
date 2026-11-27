@@ -42,6 +42,16 @@
     <script>
         let offlineStreak = 0;
         
+        function formatRate(pps) {
+            if (!pps || pps <= 0) return '0 / sec';
+            if (pps >= 1000000) {
+                return (pps / 1000000).toFixed(2) + 'M / sec (' + Math.round(pps).toLocaleString() + ' pps)';
+            } else if (pps >= 10000) {
+                return (pps / 1000).toFixed(1) + 'K / sec (' + Math.round(pps).toLocaleString() + ' pps)';
+            }
+            return Math.round(pps).toLocaleString() + ' / sec';
+        }
+
         async function update() {
             try {
                 const pRes = await fetch('/api/panels');
@@ -79,7 +89,8 @@
                     const rRes = await fetch('/api/drops_per_sec');
                     const rData = await rRes.json();
                     if(rData.length > 0) {
-                        document.getElementById('dropRate').textContent = rData[rData.length-1].pps.toFixed(0) + ' / sec';
+                        const lastPps = rData[rData.length-1].pps;
+                        document.getElementById('dropRate').textContent = formatRate(lastPps);
                     } else {
                         document.getElementById('dropRate').textContent = '0 / sec';
                     }
