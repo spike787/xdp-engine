@@ -23,17 +23,18 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 6. [Local API (decisions + export)](#-local-api-decisions--export)
 7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
 8. [bouncer-nft (enforcement, no XDP needed)](#-bouncer-nft-enforcement-no-xdp-needed)
-9. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
-10. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
-11. [Live Showcase Dashboard](#-live-showcase-dashboard)
-12. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+9. [Privileges & capability drop](#-privileges--capability-drop)
+10. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
+11. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
+12. [Live Showcase Dashboard](#-live-showcase-dashboard)
+13. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
     - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
     - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
     - [Test 3: Network Port Scanning](#3-network-port-scanning)
     - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
     - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-13. [Configuration Files](#-configuration-files)
-14. [Troubleshooting & FAQ](#-troubleshooting--faq)
+14. [Configuration Files](#-configuration-files)
+15. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -71,7 +72,14 @@ flowchart TD
 
 ### Minimum System Requirements
 * **OS:** Linux with Kernel **5.8+** (with BTF enabled at `/sys/kernel/btf/vmlinux`).
-* **Privileges:** Root access (`sudo`) for attaching XDP to network interfaces.
+* **Privileges:** Root access (`sudo`) is the simplest way to run `engine`,
+  `bouncer-xdp`, and `bouncer-nft` - attaching XDP, loading BPF programs, and
+  editing nftables all need it from *somewhere*. As of [ADR-0006](docs/adr/0006-capability-drop.md),
+  each of these voluntarily drops every capability it isn't using once past
+  whatever privileged step it needs (if any - `engine` never needs one at
+  all), rather than keeping full root power for its entire life; see
+  [Privileges & capability drop](#-privileges--capability-drop) for a fully
+  non-root deployment recipe.
 
 ### Package Installation
 
@@ -320,6 +328,55 @@ Run at most one bouncer at a time per host — `bouncer-xdp` and
 mechanisms, and running both together is untested (see ADR-0004).
 `LOCAL_API_TOKEN`/`--lapi-token` work exactly as they do for
 `bouncer-xdp`.
+
+---
+
+## 🔒 Privileges & capability drop
+
+See [ADR-0006](docs/adr/0006-capability-drop.md) for the full writeup
+(including the sandbox tests behind these claims). Summary:
+
+| Binary | Needs privilege for | Capability footprint |
+|---|---|---|
+| `engine` | nothing, ever | drops to **zero capabilities** right after startup |
+| `bouncer-xdp` | loading/attaching the XDP program (cold start only; resuming an existing attachment needs nothing) | `CAP_BPF`+`CAP_NET_ADMIN` during cold-start attach, then **zero** |
+| `bouncer-nft` | every `nft` invocation, for its whole life | `CAP_NET_ADMIN` only, for its whole life |
+| `local-api` | nothing | never needed privilege, unchanged |
+| either bouncer's `cleanup` subcommand | detach/unpin or flush, a short one-shot admin command | unchanged - stays fully privileged, by design |
+
+**Simplest path - still `sudo`, nothing to configure.** Every command above
+in this README works exactly as written; each binary now just drops what
+it isn't using once it's past any privileged step, rather than keeping
+full root power for its whole life. Nothing to opt into.
+
+**Fully non-root, if you want it.** This requires provisioning a system
+user/group yourself (this project doesn't create one for you - same
+"don't auto-provision system state" boundary as everywhere else in this
+codebase):
+
+```bash
+# One-time: a group engine can read pinned maps through, and a service user.
+sudo groupadd xdp-engine
+sudo useradd --system --no-create-home --gid xdp-engine xdp-engine-svc
+
+# bouncer-xdp still needs a real privileged cold-start once, but hands
+# engine a non-root path in afterward:
+sudo XDP_ENGINE_GROUP=xdp-engine ./bouncer-xdp wlp8s0
+sudo -u xdp-engine-svc ./engine wlp8s0 --enforce
+
+# bouncer-nft, via setpriv (a systemd unit with User=xdp-engine-svc and
+# AmbientCapabilities=CAP_NET_ADMIN gets you the same thing more durably):
+sudo setpriv --reuid="$(id -u xdp-engine-svc)" --regid=xdp-engine --clear-groups \
+    --inh-caps=+net_admin --ambient-caps=+net_admin --bounding-set=+net_admin \
+    -- ./bouncer-nft --iface wlp8s0
+```
+
+Every command in that block was run as written against this sandbox's own
+nftables stack while writing ADR-0006 (`bouncer-nft` really did create a
+working table as uid 999/gid 30001 with nothing but `CAP_NET_ADMIN`); the
+`bouncer-xdp`/`engine`/`XDP_ENGINE_GROUP` half still needs your hardware to
+confirm against a real NIC, the same as every other XDP-attach change in
+this project.
 
 ---
 

@@ -38,6 +38,7 @@
 #include <numeric>
 
 #include "common.h"
+#include "capdrop.h"
 #include "event.h"
 #include "rule_engine.h"
 #include "storage.h"
@@ -597,6 +598,19 @@ int main(int argc, char** argv) {
         }
 
         XdpEngine engine{bpf_obj, iface};
+
+        // ADR-0006: engine never needs any Linux capability at all, even when
+        // started via sudo. The fds above came from bpf_obj_get() on pinned
+        // *maps* (not programs/links), which the kernel gates with ordinary
+        // file permissions on the bpffs pin, not a capability - and every
+        // bpf_map_*_elem() call that follows is permitted purely by virtue of
+        // already holding that fd. Dropping everything here, right after the
+        // fds are in hand, means a bug or compromise in the rest of engine's
+        // long-running life (parsing logs, running rules, talking to
+        // storage/playbooks) can't be leveraged into anything BPF/root can do.
+        capdrop::drop_bounding_except({});
+        capdrop::drop_all_capabilities("[engine]");
+
         BlockList blocklist{engine.allowed_fd(), engine.blocked_fd(), engine.stats_fd(), engine.proto_stats_fd(), allow, &storage};
         
         PlaybookRunner::BlockCallback block_cb = [&](const std::string& ip_str, const std::string& rule, int seconds) -> int {

@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include "bouncer_diff.h"
+#include "capdrop.h"
 #include "nft_bouncer_core.h"
 
 namespace {
@@ -238,6 +239,24 @@ int main(int argc, char** argv) {
         std::cerr << "[warn] LOCAL_API_TOKEN is not set; requests to Local API will be "
                      "unauthenticated and will fail unless local-api was also started "
                      "without a token.\n";
+    }
+
+    // ADR-0006: unlike bouncer-xdp/engine, bouncer-nft needs CAP_NET_ADMIN for
+    // its entire life, not just a one-time setup step - every poll iteration
+    // execs `nft` again (run_nft_script(), above) to apply that round's diff.
+    // So we drop everything else now, keep CAP_NET_ADMIN, and push it into
+    // the *ambient* set: that's what makes a plain, non-file-capability
+    // child binary like `nft` inherit exactly that one capability across
+    // execve regardless of bouncer-nft's own uid (root via sudo today, or a
+    // dedicated non-root service user under systemd's AmbientCapabilities=
+    // in the future) - see docs/adr/0006-capability-drop.md for the sandbox
+    // verification of this exact ambient-capability + execve pattern.
+    capdrop::drop_bounding_except({CAP_NET_ADMIN});
+    capdrop::drop_capabilities_to({CAP_NET_ADMIN}, "[bouncer-nft]");
+    if (!capdrop::raise_ambient(CAP_NET_ADMIN)) {
+        std::cerr << "[bouncer-nft] warning: could not raise CAP_NET_ADMIN into the ambient "
+                     "set (" << std::strerror(errno) << ") - nft invocations below may fail "
+                     "if this process isn't running as plain root\n";
     }
 
     struct sigaction sa{};
