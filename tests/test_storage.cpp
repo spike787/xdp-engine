@@ -175,3 +175,41 @@ TEST(StorageExportTest, CsvExportNeutralizesFormulaInjectionInUserField) {
 
     std::filesystem::remove(path);
 }
+
+// ADR-0009: GET /metrics is served by local-api's own Storage connection,
+// which is a *different process* from the one (engine.cpp) actually
+// writing packet-counter rows - exactly the two-connections-one-file
+// shape this test builds directly, without needing two real processes.
+// get_metrics_summary() used to leave its prepared statements parked in
+// SQLITE_ROW state after reading their one row, only resetting them at
+// the top of the *next* call - which in WAL mode can leave a connection's
+// implicit read transaction pinned to a stale snapshot indefinitely,
+// since that transaction only truly ends once every participating
+// statement has been reset or drained. The fix resets each statement
+// immediately after use, not just before reuse - this test fails without
+// that fix and passes with it.
+TEST(StorageMetricsTest, SummaryReflectsEachNewRowAcrossSeparateConnections) {
+    auto path = fresh_db_path();
+    std::filesystem::remove(path);
+
+    Storage writer(path);   // stands in for engine.cpp's connection
+    Storage reader(path);   // stands in for local-api's connection
+
+    writer.insert_metrics(1000, 0, 100, 50, 50, 0, 0, 200, "DETECT");
+    auto first = reader.get_metrics_summary();
+    ASSERT_TRUE(first.packets.has_data);
+    EXPECT_EQ(first.packets.passed, 100u);
+
+    writer.insert_metrics(1001, 0, 200, 90, 90, 20, 0, 200, "DETECT");
+    auto second = reader.get_metrics_summary();
+    EXPECT_EQ(second.packets.passed, 200u) << "reader is still serving a stale snapshot "
+                                               "from before the second insert_metrics() call";
+    EXPECT_EQ(second.packets.icmp, 20u);
+
+    writer.insert_metrics(1002, 0, 300, 120, 120, 40, 0, 200, "DETECT");
+    auto third = reader.get_metrics_summary();
+    EXPECT_EQ(third.packets.passed, 300u) << "reader did not pick up the third insert_metrics() call either";
+    EXPECT_EQ(third.packets.icmp, 40u);
+
+    std::filesystem::remove(path);
+}
