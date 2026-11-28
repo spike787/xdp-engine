@@ -130,6 +130,16 @@ int main(int argc, char** argv) {
         res.set_content(body, content_type);
     });
 
+    // ROADMAP.md phase 3: Prometheus metrics. Auth-gated the same as
+    // /decisions and /export - a scrape config authenticates with
+    // `authorization: {credentials: "<token>"}`, the standard way
+    // Prometheus sends a static bearer token.
+    svr.Get("/metrics", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth(req, res)) return;
+        auto summary = storage.get_metrics_summary();
+        res.set_content(format_prometheus_metrics(summary), "text/plain; version=0.0.4; charset=utf-8");
+    });
+
     std::cout << "[local-api] listening on :" << port << " (db=" << db_path << ")\n";
     svr.listen("0.0.0.0", port);
     return 0;

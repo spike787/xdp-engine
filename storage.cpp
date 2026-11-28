@@ -68,6 +68,17 @@ Storage::Storage(const std::string& db_path) {
         "         ROW_NUMBER() OVER (PARTITION BY ip ORDER BY id DESC) AS rn"
         "  FROM decisions"
         ") WHERE rn = 1 AND action = 'block' AND (expires_at_unix = 0 OR expires_at_unix > ?)"));
+
+    // Same latest-row-wins query the live dashboard already uses
+    // (dashboard/app.py) - GET /metrics reports the same numbers the
+    // showcase UI shows, not a second, potentially-drifting source of
+    // truth for the same data.
+    get_latest_metrics_stmt_.reset(prepare(
+        "SELECT ts, dropped, passed, tcp, udp, icmp, other, syn_limit, xdp_mode "
+        "FROM metrics ORDER BY ts DESC LIMIT 1"));
+
+    count_alerts_stmt_.reset(prepare("SELECT COUNT(*) FROM alerts"));
+    count_events_stmt_.reset(prepare("SELECT COUNT(*) FROM events"));
 }
 
 void Storage::exec_schema() {
@@ -383,6 +394,46 @@ std::vector<Decision> Storage::get_active_decisions() {
         out.push_back(std::move(d));
     }
     return out;
+}
+
+MetricsSummary Storage::get_metrics_summary() {
+    MetricsSummary m;
+    {
+        // Scoped deliberately: get_active_decisions() below takes
+        // db_mutex_ itself (it's a public method meant to be called
+        // standalone, e.g. from GET /decisions), and std::mutex isn't
+        // recursive - holding the lock across that call would deadlock.
+        std::lock_guard<std::mutex> lock(db_mutex_);
+
+        sqlite3_reset(get_latest_metrics_stmt_.get());
+        if (sqlite3_step(get_latest_metrics_stmt_.get()) == SQLITE_ROW) {
+            auto* stmt = get_latest_metrics_stmt_.get();
+            m.packets.has_data = true;
+            m.packets.ts = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 0));
+            m.packets.dropped = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 1));
+            m.packets.passed = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 2));
+            m.packets.tcp = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
+            m.packets.udp = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
+            m.packets.icmp = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 5));
+            m.packets.other = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 6));
+            m.packets.syn_limit = sqlite3_column_int(stmt, 7);
+            const unsigned char* mode_text = sqlite3_column_text(stmt, 8);
+            m.packets.xdp_mode = mode_text ? reinterpret_cast<const char*>(mode_text) : "";
+        }
+
+        sqlite3_reset(count_alerts_stmt_.get());
+        if (sqlite3_step(count_alerts_stmt_.get()) == SQLITE_ROW) {
+            m.alerts_total = sqlite3_column_int64(count_alerts_stmt_.get(), 0);
+        }
+
+        sqlite3_reset(count_events_stmt_.get());
+        if (sqlite3_step(count_events_stmt_.get()) == SQLITE_ROW) {
+            m.events_total = sqlite3_column_int64(count_events_stmt_.get(), 0);
+        }
+    }
+
+    m.active_decisions = static_cast<long long>(get_active_decisions().size());
+    return m;
 }
 
 namespace {

@@ -53,14 +53,14 @@ replay-cli: tools/replay_cli.cpp replay_core.h http_classifier.h log_parser.h ru
 # Local API: the shared control plane (ROADMAP.md phase 1). No BPF/libcurl
 # dependency — it only needs the storage layer and an HTTP server.
 HTTPLIB_FLAGS := $(shell pkg-config --cflags --libs cpp-httplib 2>/dev/null)
-local-api: local_api.cpp storage.cpp storage.h
+local-api: local_api.cpp storage.cpp storage.h prometheus_metrics.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
 
 clean:
 	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp rule_engine.cpp http_detector.cpp storage.cpp
+test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp tests/test_prometheus_metrics.cpp rule_engine.cpp http_detector.cpp storage.cpp
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 

@@ -9,6 +9,7 @@
 #include <mutex>
 #include "event.h"
 #include "rule_engine.h"
+#include "prometheus_metrics.h"
 
 struct SqliteDeleter {
     void operator()(sqlite3* db) const noexcept {
@@ -72,6 +73,18 @@ public:
     std::string export_alerts(const std::string& format, const std::string& since_iso, const std::string& until_iso);
     std::string export_events(const std::string& format, const std::string& since_iso, const std::string& until_iso);
 
+    // --- Local API support: Prometheus metrics (ROADMAP.md phase 3) ---
+
+    // Gathers the plain data GET /metrics needs: the most recent packet-
+    // counter row engine.cpp's metrics_poller wrote (see
+    // PacketMetricsSnapshot's own doc comment for why "no row yet" is
+    // tracked explicitly rather than defaulted to zero), plus lifetime
+    // alert/event counts and the current active-decision count. Formatting
+    // this into the actual Prometheus exposition text is
+    // format_prometheus_metrics()'s job (prometheus_metrics.h), kept pure
+    // and separate so it's unit-testable without a real database.
+    MetricsSummary get_metrics_summary();
+
 private:
     void exec_schema();
     std::string run_export(const std::string& sql, const std::vector<std::string>& binds, const std::string& format);
@@ -89,6 +102,9 @@ private:
     StmtPtr reset_offense_stmt_;
     StmtPtr insert_decision_stmt_;
     StmtPtr get_active_decisions_stmt_;
+    StmtPtr get_latest_metrics_stmt_;
+    StmtPtr count_alerts_stmt_;
+    StmtPtr count_events_stmt_;
 };
 
 #endif // STORAGE_H
