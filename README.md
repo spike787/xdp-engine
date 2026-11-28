@@ -181,6 +181,7 @@ under [`docs/`](docs/):
 - [Enforcement (bouncers)](docs/enforcement.md) — bouncer-xdp, bouncer-nft, bouncer-proxy, and the privilege/capability model
 - [Detection internals](docs/detection.md) — the staged parser pipeline, replay-cli, parser fuzzing, IPv6 header parsing
 - [Testing & attack simulation lab](docs/testing.md) — commands to exercise every detection path, plus the 1-2M drops/sec benchmark
+- [Multi-host lab](docs/multihost-lab.md) — proving one shared Local API driving several independently-enforcing bouncers across real namespace/network boundaries
 - [Troubleshooting & FAQ](docs/troubleshooting.md)
 - [Architecture decision records](docs/adr/) — the reasoning behind each major design choice, numbered in order
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md) — component breakdown and trust boundaries
