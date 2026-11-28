@@ -127,7 +127,7 @@ bool fetch_decisions(const std::string& lapi_url, const std::string& token,
         out_ips.clear();
         for (const auto& d : arr) {
             std::string ip_str = d.value("ip", "");
-            std::uint32_t ip_net;
+            std::uint32_t ip_net = 0;
             if (!ip_str.empty() && ipv4_string_to_net(ip_str, ip_net)) {
                 out_ips.insert(ip_net);
             }

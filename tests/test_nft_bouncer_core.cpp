@@ -11,7 +11,7 @@
 
 namespace {
 std::uint32_t ip(const std::string& dotted) {
-    std::uint32_t out;
+    std::uint32_t out = 0;
     EXPECT_TRUE(ipv4_string_to_net(dotted, out));
     return out;
 }
@@ -20,13 +20,13 @@ std::uint32_t ip(const std::string& dotted) {
 // --- ipv4_string_to_net / ipv4_net_to_string -----------------------------
 
 TEST(NftBouncerCoreTest, Ipv4RoundTripsThroughNetworkOrder) {
-    std::uint32_t net;
+    std::uint32_t net = 0;
     ASSERT_TRUE(ipv4_string_to_net("203.0.113.9", net));
     EXPECT_EQ(ipv4_net_to_string(net), "203.0.113.9");
 }
 
 TEST(NftBouncerCoreTest, Ipv4StringToNetRejectsGarbage) {
-    std::uint32_t net;
+    std::uint32_t net = 0;
     EXPECT_FALSE(ipv4_string_to_net("not-an-ip", net));
     EXPECT_FALSE(ipv4_string_to_net("999.999.999.999", net));
     EXPECT_FALSE(ipv4_string_to_net("", net));

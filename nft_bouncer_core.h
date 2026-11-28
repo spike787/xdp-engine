@@ -93,7 +93,7 @@ inline bool parse_set_elements(const std::string& nft_json, std::unordered_set<s
                     ip_str = inner["val"].get<std::string>();
                 }
             }
-            std::uint32_t ip_net;
+            std::uint32_t ip_net = 0;
             if (!ip_str.empty() && ipv4_string_to_net(ip_str, ip_net)) {
                 result.insert(ip_net);
             }
