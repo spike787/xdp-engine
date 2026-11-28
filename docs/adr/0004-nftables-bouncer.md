@@ -136,13 +136,28 @@ optional enforcement surface rather than a required component.
   nftables rulesets live in kernel memory, not on disk, and nothing here
   re-applies them at boot. That's the same known gap ADR-0002 already
   called out for the BPF pins, now also true here, and still future work.
-- Running both bouncers on the same host at once is unsupported and
-  untested by this ADR - each independently enforces the same
-  `/decisions` feed by its own mechanism, so in principle they'd just be
-  redundant, but verifying there's no interaction between an XDP drop and
-  an nftables `input` hook rule (there shouldn't be - XDP runs earlier
-  and a dropped packet never reaches `input` - but this hasn't been
-  tested) is left for whenever that configuration is actually needed.
+- Running both bouncers on the same host at once was in fact tested
+  (real hardware, both `bouncer-xdp` and `bouncer-nft` polling the same
+  `local-api` concurrently): `engine-cli block`/`unblock` correctly
+  propagated to both - the kernel's `blocked_ips` BPF map and the
+  `xdp_engine`/`blocked_ips` nftables set stayed in sync with each other
+  the whole time, with no observed interaction between the two. This
+  matches the expectation stated here originally (XDP runs earlier and a
+  dropped packet never reaches the `input` hook, so the two can't
+  conflict) - noted now as confirmed rather than merely expected.
+- **Coexistence with a distro firewall manager (e.g. Fedora's
+  `firewalld`) was not accounted for in the original design and is worth
+  calling out.** `firewalld` installs its own `inet firewalld` table,
+  which - like `bouncer-nft`'s `inet xdp_engine` table - registers chains
+  on the same netfilter hooks. Multiple tables can coexist on one hook
+  (nftables evaluates every table registered there, ordered by chain
+  priority), and this was observed to work without conflict in testing,
+  but nothing here verifies `firewalld`'s own base chains don't
+  `accept`/`continue` traffic in a way that interacts unexpectedly with
+  `bouncer-nft`'s own priority-0 `input` chain on every possible
+  `firewalld` configuration (zones, rich rules, etc.) - only the default
+  Fedora Workstation firewalld setup was exercised. Worth a closer look
+  before relying on this combination for anything beyond testing.
 
 ## Alternatives considered
 
