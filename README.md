@@ -1,711 +1,193 @@
-# 🛡️ XDP-Engine: Kernel-Speed Intrusion Mitigation & SOAR
+# xdp-engine
 
-An enterprise-grade, eBPF-powered firewall and Security Orchestration, Automation, and Response (SOAR) engine.  
-Filters millions of malicious packets per second in Linux kernel space at driver speed before they reach the OS networking stack, backed by automated log correlation, rule-based playbooks, and a live web telemetry dashboard.
+An eBPF/XDP-based intrusion mitigation engine for Linux, built around a
+CrowdSec-style split between detection and enforcement: a rule engine
+correlates log and traffic signals into decisions, and independent
+"bouncer" processes enforce those decisions at whichever layer suits the
+host — kernel driver, netfilter, or an HTTP reverse proxy.
 
-![Build Status](https://github.com/v1shad/xdp-engine/actions/workflows/build.yml/badge.svg)
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![eBPF / XDP](https://img.shields.io/badge/eBPF-XDP%20Hook-orange.svg)
-![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+The core firewall path (`xdp_prog.bpf.c`) attaches at the network driver
+and can drop traffic at line rate, before it reaches the kernel's normal
+networking stack. Detection (SSH brute force, SQL injection, path
+traversal, port scans, correlated multi-stage attacks) runs in user space
+against log tails and kernel telemetry, with responses driven by
+declarative YAML playbooks and surfaced on a live web dashboard.
 
----
+[![Build](https://github.com/spike787/xdp-engine/actions/workflows/build.yml/badge.svg)](https://github.com/spike787/xdp-engine/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](#)
 
-## 📌 Table of Contents
-1. [Overview & Key Features](#-overview--key-features)
-2. [System Architecture](#-system-architecture)
-3. [Prerequisites & Dependencies](#-prerequisites--dependencies)
-4. [Step-by-Step Setup Guide](#-step-by-step-setup-guide)
-   - [Step 1: Clone the Repository](#step-1-clone-the-repository)
-   - [Step 2: Build the Engine](#step-2-build-the-engine)
-   - [Step 3: Launch the Web Dashboard](#step-3-launch-the-web-dashboard)
-   - [Step 4: Launch Enforcement, the Local API, and the Engine](#step-4-launch-enforcement-the-local-api-and-the-engine-in-that-order)
-5. [Interactive Console Commands](#-interactive-console-commands)
-6. [Local API (decisions + export)](#-local-api-decisions--export)
-7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
-8. [bouncer-nft (enforcement, no XDP needed)](#-bouncer-nft-enforcement-no-xdp-needed)
-9. [bouncer-proxy (enforcement, app-layer)](#-bouncer-proxy-enforcement-app-layer)
-10. [Privileges & capability drop](#-privileges--capability-drop)
-11. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
-12. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
-13. [Parser fuzzing](#-parser-fuzzing)
-14. [IPv6 header parsing](#-ipv6-header-parsing)
-15. [Live Showcase Dashboard](#-live-showcase-dashboard)
-16. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
-    - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
-    - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
-    - [Test 3: Network Port Scanning](#3-network-port-scanning)
-    - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
-    - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-17. [Configuration Files](#-configuration-files)
-18. [Troubleshooting & FAQ](#-troubleshooting--faq)
+## Contents
 
----
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Building](#building)
+- [Running the stack](#running-the-stack)
+- [Console commands](#console-commands)
+- [Configuration files](#configuration-files)
+- [Documentation](#documentation)
+- [License](#license)
 
-## 🚀 Overview & Key Features
-
-* **Kernel eBPF / XDP Filtering:** Drops packets at line rate (up to 2,000,000+ packets/sec) directly in the network driver before Linux allocates `sk_buff` socket buffers.
-* **Massive Concurrency:** Hardware-backed BPF Hash Maps preallocate tracking for up to **1,000,000 unique IP addresses**.
-* **Log Ingestion & Detection (SIEM):** Real-time asynchronous tailing of SSH authentication logs (`/var/log/secure` or `/var/log/auth.log`) and Web Server access logs (`/var/log/nginx/access.log`).
-* **Automated Playbook Response (SOAR):** Declarative YAML playbooks automatically execute time-limited kernel bans, alert webhooks, and IP reputation tracking.
-* **Complex Attack Correlation:** State machine tracks correlated multi-stage threats (e.g., `SCAN_THEN_BRUTE` sequences).
-* **Dynamic Mode Switching:** Seamlessly toggle between **Detect Mode** (audit logging) and **Enforce Mode** (active kernel dropping) on the fly without restarting the engine.
-* **Safety Guardrails:** Automatic whitelisting of `127.0.0.1`, local interface IPs, and default gateway routes to prevent accidental self-lockouts.
-
----
-
-## 🏛️ System Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
-    A["Incoming Network Traffic & Log Streams"] --> B["Kernel XDP Hook<br><code>xdp_prog.bpf.c</code>"]
-    B -->|Passed Packets| C["Linux Network Stack & Services (SSH, Nginx)"]
-    C -->|Auth & Access Logs| D["Log Tailers & Detectors<br><code>http_detector.cpp, log_tailer.h</code>"]
-    B -->|Telemetry Events via RingBuffer| D
-    D --> E{"Rule Engine<br><code>rules.yaml</code>"}
-    E -->|Rule Match| F["Playbook Runner<br><code>playbooks.yaml</code>"]
-    F -->|Enforce Ban| G["eBPF BPF_MAP_UPDATE<br><code>blocked_ips map</code>"]
-    G -->|Immediate Drop| B
-    F -->|Audit Log| H[("SQLite Database<br><code>engine.db</code>")]
-    H --> I["Real-time Web Dashboard<br><code>dashboard/app.py</code> (Port 5000)"]
+    A["Incoming traffic & log streams"] --> B["Kernel XDP hook<br><code>xdp_prog.bpf.c</code>"]
+    B -->|passed packets| C["Linux network stack & services (SSH, nginx)"]
+    C -->|auth & access logs| D["Log tailers & detectors<br><code>http_detector.cpp, log_parser.h</code>"]
+    B -->|telemetry via ring buffer| D
+    D --> E{"Rule engine<br><code>rules.yaml</code>"}
+    E -->|match| F["Playbook runner<br><code>playbooks.yaml</code>"]
+    F -->|decision| G["Local API<br><code>local-api</code>"]
+    G -->|polled| H["Bouncers<br>xdp / nftables / proxy"]
+    H -->|enforce| B
+    F -->|audit log| I[("SQLite<br><code>engine.db</code>")]
+    I --> J["Web dashboard<br><code>dashboard/app.py</code>"]
 ```
 
----
+Detection decides, `local-api` records and serves the decision, and
+whichever bouncer you run enforces it — the three are independent
+processes communicating only through that API. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for the component-level breakdown,
+[`THREAT_MODEL.md`](THREAT_MODEL.md) for trust boundaries and assumptions,
+and [`ROADMAP.md`](ROADMAP.md) for where this project is headed next
+(multi-host deployments sharing one Local API).
 
-## 📦 Prerequisites & Dependencies
+## Requirements
 
-### Minimum System Requirements
-* **OS:** Linux with Kernel **5.8+** (with BTF enabled at `/sys/kernel/btf/vmlinux`).
-* **Privileges:** Root access (`sudo`) is the simplest way to run `engine`,
-  `bouncer-xdp`, and `bouncer-nft` - attaching XDP, loading BPF programs, and
-  editing nftables all need it from *somewhere*. As of [ADR-0006](docs/adr/0006-capability-drop.md),
-  each of these voluntarily drops every capability it isn't using once past
-  whatever privileged step it needs (if any - `engine` never needs one at
-  all), rather than keeping full root power for its entire life; see
-  [Privileges & capability drop](#-privileges--capability-drop) for a fully
-  non-root deployment recipe.
+- Linux kernel 5.8+, with BTF enabled at `/sys/kernel/btf/vmlinux`.
+- `sudo` is the simplest way to run `engine`, `bouncer-xdp`, and
+  `bouncer-nft` — attaching XDP, loading BPF programs, and editing
+  nftables all need elevated privilege from *somewhere*. Each of these
+  drops every capability it isn't using once past whatever privileged
+  step it needs, rather than keeping full root power for its entire life;
+  see [Enforcement & privileges](docs/enforcement.md) for a fully
+  non-root deployment.
 
-### Package Installation
+### Fedora / RHEL
 
-#### Fedora / RHEL
 ```bash
 sudo dnf install -y clang llvm libbpf-devel elfutils-libelf-devel \
     sqlite-devel yaml-cpp-devel libcurl-devel gtest-devel python3-flask make gcc-c++
 ```
 
-#### Ubuntu / Debian
+### Ubuntu / Debian
+
 ```bash
 sudo apt update
 sudo apt install -y clang llvm libbpf-dev libelf-dev libsqlite3-dev \
     libyaml-cpp-dev libcurl4-openssl-dev libgtest-dev python3-flask make g++
 ```
 
----
+## Building
 
-## 📖 Step-by-Step Setup Guide
-
-Follow these 4 simple steps to get the entire engine and live dashboard running:
-
-### Step 1: Clone the Repository
 ```bash
-git clone https://github.com/v1shad/xdp-engine.git
+git clone https://github.com/spike787/xdp-engine.git
 cd xdp-engine
-```
-
-### Step 2: Build the Engine
-Compile the eBPF kernel bytecode and the C++ user-space daemon:
-```bash
 make
 ```
-*This generates `xdp_prog.bpf.o` (eBPF object) and `./engine` (C++20 binary).*
 
-### Step 3: Launch the Web Dashboard
-Open your **first terminal window** and run:
+This builds the eBPF object (`xdp_prog.bpf.o`) and every C++20 binary:
+`engine`, `engine-cli`, `local-api`, and the three bouncers
+(`bouncer-xdp`, `bouncer-nft`, `bouncer-proxy`). Run `make test` to build
+and run the unit test suite (no root or kernel features required).
+
+## Running the stack
+
+Start the dashboard, enforcement, the Local API, and the engine, in that
+order — each later step depends on the one before it.
+
+**1. Web dashboard**
+
 ```bash
-cd dashboard
-python3 app.py
+cd dashboard && python3 app.py
 ```
-Open your browser to:
-👉 **`http://127.0.0.1:5000/?showcase=1`**
 
-*(While the engine is not yet started, the top-right badge cleanly pulses **`Loading Mode...`** in Standby).*
+Open `http://127.0.0.1:5000/?showcase=1`. The mode badge in the top right
+shows **Loading Mode…** until the engine connects, then switches to
+**Detect** (blue) or **Enforce** (red) depending on how the engine was
+started. Below it: a live packet-drop counter and rate meter, currently
+blocked IPs with countdown timers, and a color-coded feed of detections
+and mitigation events as they happen.
 
-### Step 4: Launch Enforcement, the Local API, and the Engine (in that order)
-
-Since [ADR-0002](docs/adr/0002-bouncer-xdp-separation.md), detection and
-enforcement are separate binaries, and **startup order matters**:
-`bouncer-xdp` must be running on an interface before `engine` will start
-on it, because `engine` opens maps that only exist once `bouncer-xdp` has
-pinned them.
-
-1. Identify your active network interface (e.g. `wlp8s0` for Wi-Fi or `eth0` / `enp3s0` for Ethernet):
-   ```bash
-   ip route get 1.1.1.1 | awk '{print $5; exit}'
-   ```
-2. **Terminal 2 — enforcement** (replace `wlp8s0` with your interface name):
-   ```bash
-   sudo ./bouncer-xdp wlp8s0
-   ```
-   This loads `xdp_prog.bpf.c`, attaches it, and pins every map under
-   `/sys/fs/bpf/xdp_engine/`. Leave it running — see the
-   [bouncer-xdp](#-bouncer-xdp-enforcement) section below for what it's
-   actually doing and how to clean it up.
-3. **Terminal 3 — Local API** (so bouncer-xdp has decisions to poll):
-   ```bash
-   LOCAL_API_TOKEN=your-secret ./local-api engine.db 8088
-   ```
-4. **Terminal 4 — the engine itself**:
-   ```bash
-   sudo ./engine wlp8s0
-   ```
-   *To start directly in active hardware drop mode, add `--enforce`:*
-   ```bash
-   sudo ./engine wlp8s0 --enforce
-   ```
-   If this fails with "could not open pinned maps", `bouncer-xdp` isn't
-   running on this interface yet — go back to step 2.
-
-Within 1 second, the dashboard badge will light up in **`DETECT MODE`** (Blue) or **`ENFORCE MODE`** (Red)!
-
-A block decided by the rule engine or by `block <IP>` below now takes
-effect once `bouncer-xdp` applies it on its next poll (default every 2s),
-not instantly — `list` shows `[pending]` vs `[enforced]` so you can see
-exactly where a given IP is in that pipeline.
-
----
-
-## 🎮 Interactive Console Commands
-
-While `./engine` is running, you can type commands directly into its terminal:
-
-| Command | Action | Example |
-|---|---|---|
-| `mode enforce` *(or `enforce`)* | Instantly switches the firewall to **Active Kernel Blocking** (Dashboard turns **RED**). | `mode enforce` |
-| `mode detect` *(or `detect`)* | Switches to **Passive Detection Mode** without dropping packets (Dashboard turns **BLUE**). | `mode detect` |
-| `mode show` *(or `mode`)* | Prints the current operating mode. | `mode` |
-| `block <IP> [TTL]` | Records a block decision with optional expiry (default: 600s). `bouncer-xdp` applies it to the kernel on its next poll — see Step 4. | `block 192.168.1.100 300` |
-| `unblock <IP>` | Records an unblock decision; `bouncer-xdp` removes the kernel entry on its next poll. | `unblock 192.168.1.100` |
-| `allow <IP>` | Whitelists an IP so it will never be banned. | `allow 192.168.1.50` |
-| `unallow <IP>` | Removes an IP from the whitelist. | `unallow 192.168.1.50` |
-| `list` | Displays every active block decision, its remaining TTL, and whether `bouncer-xdp` has enforced it yet (`[enforced]`/`[pending]`). | `list` |
-| `stats` | Prints real-time packet counters: dropped, passed, TCP, UDP, and ICMP. | `stats` |
-| `alerts` | Prints the 10 most recent security alerts. | `alerts` |
-| `quit` | Marks status `OFFLINE` and exits. Enforcement is unaffected — `bouncer-xdp` keeps running and keeps applying decisions independently. | `quit` |
-
----
-
-## 🧭 Local API (decisions + export)
-
-A separate `local-api` binary reads the same `engine.db` SQLite file the
-engine writes to, and exposes it over HTTP. This is the first piece of the
-architecture described in [`ROADMAP.md`](ROADMAP.md) — see
-[`docs/adr/0001-architecture.md`](docs/adr/0001-architecture.md) for why.
+**2. Enforcement** — pick an interface first:
 
 ```bash
-make local-api
+ip route get 1.1.1.1 | awk '{print $5; exit}'
+sudo ./bouncer-xdp wlp8s0
+```
+
+This loads `xdp_prog.bpf.c`, attaches it, and pins its maps under
+`/sys/fs/bpf/xdp_engine/`. Leave it running — see
+[Enforcement (bouncers)](docs/enforcement.md) for what it's doing, how to
+clean it up, and the two alternative bouncers (`bouncer-nft`,
+`bouncer-proxy`) for hosts without XDP support.
+
+**3. Local API**, so the bouncer has decisions to poll:
+
+```bash
 LOCAL_API_TOKEN=your-secret ./local-api engine.db 8088
 ```
 
-| Endpoint | Purpose |
+**4. The engine itself:**
+
+```bash
+sudo ./engine wlp8s0
+# or, to start directly in active kernel-drop mode:
+sudo ./engine wlp8s0 --enforce
+```
+
+If this fails with "could not open pinned maps", `bouncer-xdp` isn't
+running on that interface yet — go back to step 2.
+
+A block decided by the rule engine, or typed via `block <IP>`, takes
+effect once the bouncer applies it on its next poll (default every 2s),
+not instantly — `list` shows `[pending]` vs `[enforced]` so you can see
+exactly where a given IP is in that pipeline.
+
+## Console commands
+
+While `./engine` is running, type commands directly into its terminal:
+
+| Command | Action |
 |---|---|
-| `GET /healthz` | Liveness check, no auth required |
-| `GET /decisions` | Active block decisions, as served to bouncers |
-| `GET /export?type=alerts\|events&format=csv\|json&since=&until=` | Evidence export, filterable by ISO-8601 timestamp range |
-| `GET /metrics` | Prometheus exposition format — see below |
+| `mode enforce` | Switch to active kernel blocking (dashboard turns red) |
+| `mode detect` | Switch to passive detection only (dashboard turns blue) |
+| `mode` | Print the current operating mode |
+| `block <IP> [TTL]` | Record a block decision, default TTL 600s |
+| `unblock <IP>` | Record an unblock decision |
+| `allow <IP>` / `unallow <IP>` | Add/remove an IP from the whitelist |
+| `list` | Show every active decision and its enforcement status |
+| `stats` | Packet counters: dropped, passed, TCP/UDP/ICMP |
+| `alerts` | The 10 most recent security alerts |
+| `quit` | Exit the console — enforcement is unaffected, the bouncer keeps running independently |
+
+## Configuration files
+
+| File | Purpose |
+|---|---|
+| `rules.yaml` | Detection rules, regex signatures, sliding-window thresholds, severities |
+| `playbooks.yaml` | Response actions per rule (block duration, webhook notifications, escalation) |
+| `known_ips.txt` | Permanent administrative IP whitelist |
+| `blocklist.txt` | Static permanent IP blocklist loaded on boot |
+| `parsers/s01-parse/*.yaml` | Per-log-source envelope parsers — see [Detection internals](docs/detection.md) |
+
+## Documentation
+
+The sections above cover getting the stack running. Everything else lives
+under [`docs/`](docs/):
+
+- [Local API](docs/local-api.md) — decisions, evidence export, Prometheus metrics
+- [Enforcement (bouncers)](docs/enforcement.md) — bouncer-xdp, bouncer-nft, bouncer-proxy, and the privilege/capability model
+- [Detection internals](docs/detection.md) — the staged parser pipeline, replay-cli, parser fuzzing, IPv6 header parsing
+- [Testing & attack simulation lab](docs/testing.md) — commands to exercise every detection path, plus the 1-2M drops/sec benchmark
+- [Troubleshooting & FAQ](docs/troubleshooting.md)
+- [Architecture decision records](docs/adr/) — the reasoning behind each major design choice, numbered in order
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md) — component breakdown and trust boundaries
+- [`ROADMAP.md`](ROADMAP.md) — project direction and phase status
+
+## License
 
-Every request other than `/healthz` requires `Authorization: Bearer <token>`
-matching `LOCAL_API_TOKEN`. If that variable is unset, the API logs a
-warning and runs unauthenticated — fine for local testing, not for anything
-reachable beyond localhost.
-
-```bash
-curl -H "Authorization: Bearer your-secret" \
-  "http://127.0.0.1:8088/export?type=alerts&format=csv" -o alerts.csv
-```
-
-### Prometheus metrics
-
-`GET /metrics` reports the same numbers the live showcase dashboard
-already reads from the shared SQLite DB (ROADMAP.md Phase 3; see
-[ADR-0005](docs/adr/0005-prometheus-metrics.md)), in Prometheus's text
-exposition format:
-
-```bash
-curl -H "Authorization: Bearer your-secret" http://127.0.0.1:8088/metrics
-```
-
-```
-xdp_engine_alerts_total 42
-xdp_engine_events_total 318
-xdp_engine_decisions_active 2
-xdp_engine_packets_dropped_total 1204
-xdp_engine_packets_passed_total 88213
-xdp_engine_packets_by_protocol_total{protocol="tcp"} 70211
-xdp_engine_packets_by_protocol_total{protocol="udp"} 15902
-xdp_engine_packets_by_protocol_total{protocol="icmp"} 1800
-xdp_engine_packets_by_protocol_total{protocol="other"} 300
-xdp_engine_syn_rate_limit 200
-xdp_engine_mode{mode="enforce"} 1
-xdp_engine_mode{mode="detect"} 0
-xdp_engine_last_metrics_timestamp_seconds 1795847268
-```
-
-The packet-counter metrics (everything from `xdp_engine_packets_dropped_total`
-onward) are **omitted entirely** — not reported as zero — until `engine` has
-run at least once against this database; `xdp_engine_alerts_total`,
-`xdp_engine_events_total`, and `xdp_engine_decisions_active` are always
-present, since a real zero is a meaningful answer for those. Sample
-`prometheus.yml` scrape config:
-
-```yaml
-scrape_configs:
-  - job_name: xdp-engine
-    static_configs:
-      - targets: ["127.0.0.1:8088"]
-    authorization:
-      credentials: your-secret
-```
-
----
-
-## 🛡️ bouncer-xdp (enforcement)
-
-`bouncer-xdp` is the only binary that ever loads `xdp_prog.bpf.c` and
-attaches it to a NIC (see [ADR-0002](docs/adr/0002-bouncer-xdp-separation.md)).
-It has no rule engine and no database of its own — it just polls Local
-API's `GET /decisions` and reconciles the kernel's `blocked_ips` map to
-match, exactly like a CrowdSec remediation component.
-
-```bash
-sudo ./bouncer-xdp wlp8s0
-# or, with non-default Local API settings:
-sudo ./bouncer-xdp wlp8s0 --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
-```
-
-On first attach it pins every map plus the XDP link itself under
-`/sys/fs/bpf/xdp_engine/`. That means **restarting `bouncer-xdp` does not
-drop enforcement** — on startup it notices the existing pins and just
-resumes polling against the already-attached program instead of
-re-attaching. To actually detach and remove the pins:
-
-```bash
-sudo ./bouncer-xdp cleanup wlp8s0
-```
-
-`LOCAL_API_TOKEN` is read from the environment the same way `local-api`
-reads it; `--lapi-token` overrides it.
-
----
-
-## 🧱 bouncer-nft (enforcement, no XDP needed)
-
-`bouncer-nft` is a second, independent Remediation Component — same role
-as `bouncer-xdp` (polls Local API's `GET /decisions`, reconciles an
-enforcement surface to match), but via an nftables set instead of a BPF
-map, so it works on any host with `nft`/`nf_tables` and no XDP-capable NIC
-or kernel required (see [ADR-0004](docs/adr/0004-nftables-bouncer.md)).
-It trades `bouncer-xdp`'s line-rate packets-per-second ceiling for
-running basically anywhere.
-
-```bash
-sudo ./bouncer-nft
-# scope enforcement to one interface instead of all of them:
-sudo ./bouncer-nft --iface wlp8s0
-# or, with non-default Local API settings:
-sudo ./bouncer-nft --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
-```
-
-On first run it creates `table inet xdp_engine` with a `blocked_ips` set
-and an `input`-hook rule dropping `ip saddr @blocked_ips`. Restarting
-`bouncer-nft` resumes against the existing table/set/rule rather than
-duplicating them — the live set contents are read back and reconciled
-against `/decisions` on the very next poll, the same resume-safety
-guarantee `bouncer-xdp` makes for its pinned BPF map. To remove the table
-entirely:
-
-```bash
-sudo ./bouncer-nft cleanup
-```
-
-Run at most one bouncer at a time per host — `bouncer-xdp` and
-`bouncer-nft` both independently enforce the same decisions by different
-mechanisms, and running both together is untested (see ADR-0004).
-`LOCAL_API_TOKEN`/`--lapi-token` work exactly as they do for
-`bouncer-xdp`.
-
----
-
-## 🧭 bouncer-proxy (enforcement, app-layer)
-
-`bouncer-proxy` is the third Remediation Component — same `/decisions`
-feed as `bouncer-xdp`/`bouncer-nft`, but enforced as an HTTP reverse proxy
-in front of a single backend instead of at the packet layer (see
-[ADR-0010](docs/adr/0010-proxy-bouncer.md)). It's the answer to traffic
-the other two bouncers can't see at all — TLS-terminated application
-traffic, or a host with no XDP/`nf_tables` capability whatsoever — and the
-first bouncer that needs **zero** Linux capabilities to run, not just
-after a brief privileged startup.
-
-```bash
-# fronts dashboard/app.py (127.0.0.1:5000) on :8080 by default:
-./bouncer-proxy
-# front a different backend, on a different listen port:
-./bouncer-proxy --backend http://127.0.0.1:3000 --listen-port 9090
-# or, with non-default Local API settings:
-./bouncer-proxy --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
-```
-
-Every request is checked against the current block set (keyed by the
-client's TCP peer address) before anything is forwarded: a blocked client
-gets `403` immediately and the backend never sees the request; everything
-else is relayed through verbatim (method, full target including query
-string, body, and headers minus the hop-by-hop ones RFC 7230 §6.1 says a
-proxy must not forward), with the backend's response relayed back the
-same way. If the backend is unreachable, the client gets `502`.
-
-No `sudo` needed, and no `cleanup` subcommand — unlike the other two
-bouncers, `bouncer-proxy` has no persistent kernel-level state to tear
-down; its entire enforcement state is an in-memory set that disappears
-the moment the process stops. `LOCAL_API_TOKEN`/`--lapi-token` work
-exactly as they do for `bouncer-xdp`/`bouncer-nft`. As with the other two
-bouncers, run at most one enforcement mechanism per backend you care
-about — `bouncer-proxy` only protects requests that actually go through
-it, not the whole host.
-
----
-
-## 🔒 Privileges & capability drop
-
-See [ADR-0006](docs/adr/0006-capability-drop.md) for the full writeup
-(including the sandbox tests behind these claims). Summary:
-
-| Binary | Needs privilege for | Capability footprint |
-|---|---|---|
-| `engine` | nothing, ever | drops to **zero capabilities** right after startup |
-| `bouncer-xdp` | loading/attaching the XDP program (cold start only; resuming an existing attachment needs nothing) | `CAP_BPF`+`CAP_NET_ADMIN` during cold-start attach, then **zero** |
-| `bouncer-nft` | every `nft` invocation, for its whole life | `CAP_NET_ADMIN` only, for its whole life |
-| `bouncer-proxy` | nothing, ever | drops to **zero capabilities** right after startup (had none to begin with) |
-| `local-api` | nothing | never needed privilege, unchanged |
-| either bouncer's `cleanup` subcommand | detach/unpin or flush, a short one-shot admin command | unchanged - stays fully privileged, by design |
-
-**Simplest path - still `sudo`, nothing to configure.** Every command above
-in this README works exactly as written; each binary now just drops what
-it isn't using once it's past any privileged step, rather than keeping
-full root power for its whole life. Nothing to opt into.
-
-**Fully non-root, if you want it.** This requires provisioning a system
-user/group yourself (this project doesn't create one for you - same
-"don't auto-provision system state" boundary as everywhere else in this
-codebase):
-
-```bash
-# One-time: a group engine can read pinned maps through, and a service user.
-sudo groupadd xdp-engine
-sudo useradd --system --no-create-home --gid xdp-engine xdp-engine-svc
-
-# bouncer-xdp still needs a real privileged cold-start once, but hands
-# engine a non-root path in afterward:
-sudo XDP_ENGINE_GROUP=xdp-engine ./bouncer-xdp wlp8s0
-sudo -u xdp-engine-svc ./engine wlp8s0 --enforce
-
-# bouncer-nft, via setpriv (a systemd unit with User=xdp-engine-svc and
-# AmbientCapabilities=CAP_NET_ADMIN gets you the same thing more durably):
-sudo setpriv --reuid="$(id -u xdp-engine-svc)" --regid=xdp-engine --clear-groups \
-    --inh-caps=+net_admin --ambient-caps=+net_admin --bounding-set=+net_admin \
-    -- ./bouncer-nft --iface wlp8s0
-```
-
-Every command in that block was run as written against this sandbox's own
-nftables stack while writing ADR-0006 (`bouncer-nft` really did create a
-working table as uid 999/gid 30001 with nothing but `CAP_NET_ADMIN`); the
-`bouncer-xdp`/`engine`/`XDP_ENGINE_GROUP` half still needs your hardware to
-confirm against a real NIC, the same as every other XDP-attach change in
-this project.
-
----
-
-## 🧩 Detection Parsers (staged pipeline)
-
-The regex that recognizes a raw log line and extracts named fields from
-it (an IP, a username, a request path, a user-agent) lives in versioned
-YAML under `parsers/s01-parse/`, not hardcoded in C++ — see
-[ADR-0003](docs/adr/0003-staged-parser-pipeline.md). `SshDetector` and
-`HttpDetector` each load one of these at startup via the `LogParser`
-class (`log_parser.h`):
-
-* **`parsers/s01-parse/ssh-auth.yaml`** — matches `Failed password for ...`
-  lines from `/var/log/secure`/`/var/log/auth.log`, extracting `user` and
-  `ip`.
-* **`parsers/s01-parse/nginx-access.yaml`** — matches nginx's combined log
-  format, extracting `ip`, `path` (URL-decoded), and `user_agent`.
-
-A parser file looks like this:
-
-```yaml
-name: ssh-auth-failed-password
-source: ssh_log
-pattern: 'Failed password for (?:invalid user )?(\S+) from (\d{1,3}(?:\.\d{1,3}){3}) port \d+ ssh2'
-fields:
-  - name: user
-    group: 1          # 1-based regex capture group
-  - name: ip
-    group: 2
-emit_type: ssh_failed  # fixed event type for this source; omit if
-                       # classification depends on the extracted fields
-                       # (see nginx-access.yaml, classified against
-                       # rules.yaml's http_traversal/http_sqli/
-                       # http_scanner pattern lists instead)
-severity: 3
-```
-
-This only replaces *envelope* parsing. The attack-signature pattern lists
-that classify an HTTP request as traversal/SQLi/scanner already live in
-`rules.yaml` and are untouched by this — see the ADR for why those
-weren't also duplicated into parser YAML.
-
----
-
-## ▶️ replay-cli (log replay / backtesting)
-
-`tools/replay-cli` is a standalone CLI (ROADMAP.md Phase 2) that answers
-"would this rule have fired against this log?" without touching a kernel,
-root, or the live engine at all. It feeds a captured log file through the
-same `LogParser` + `HttpClassifier` + `RuleEngine` code paths the live
-`engine` process uses, and prints what would have alerted:
-
-```bash
-./tools/replay-cli --rules rules.yaml \
-    --parser parsers/s01-parse/ssh-auth.yaml \
-    --log /var/log/auth.log
-```
-
-```
-Replayed 1 file(s) through 'parsers/s01-parse/ssh-auth.yaml' + 'rules.yaml'
-  lines read:       5
-  lines matched:    5
-  alerts fired:     1
-    - SSH_BRUTE_FORCE  src_ip=203.0.113.9  severity=high
-```
-
-* `--log` may be repeated to replay several files (e.g. rotated logs) as
-  one combined run.
-* `--format json` prints a machine-readable summary instead (counts plus
-  one object per fired alert) for piping into other tooling.
-* Pass an HTTP-style parser (`parsers/s01-parse/nginx-access.yaml`) to
-  replay web-attack logs instead — the tool classifies traversal/SQLi/
-  scanner the same way `HttpDetector` does, against the same `rules.yaml`
-  pattern lists.
-
-**Known limitation:** replayed events are timestamped with the replay's
-own wall-clock time, not any timestamp recorded in the original log
-line. For a single burst of lines (the common "did this attack log trip
-my rule" use case) that's immaterial — threshold/sequence windows still
-see the lines arrive in a tight cluster. It does mean a log file whose
-entries were originally spread across hours replays as if they all
-happened in whatever time it takes the tool to read the file. Faithfully
-replaying original log timing would mean changing `RuleEngine`'s
-window/threshold logic to run off parsed log timestamps instead of
-`steady_clock`, which the live engine also depends on — judged out of
-scope for this phase, the same honest-scope call the ADRs make elsewhere
-about what else is and isn't built. See the comment at the top of
-`replay_core.h` for the full reasoning.
-
----
-
-## 🐛 Parser fuzzing
-
-[ADR-0007](docs/adr/0007-parser-fuzzing.md) has the full writeup. Three
-`libFuzzer` harnesses under `tools/` target the parts of this codebase
-that actually run on attacker-reachable bytes - a log line's envelope
-regex (`LogParser::parse()`), and the two hand-rolled, byte-level
-`url_decode()`/`sanitize_utf8()` helpers every extracted field goes
-through (`text_util.h`):
-
-```bash
-make fuzz               # builds all three (needs clang's fuzzer+ASan+UBSan runtime)
-./tools/fuzz-url-decode      -max_total_time=60 fuzz/corpus/url_decode
-./tools/fuzz-sanitize-utf8   -max_total_time=60 fuzz/corpus/sanitize_utf8
-./tools/fuzz-log-parser      -max_total_time=120 -timeout=5 fuzz/corpus/log_parser
-```
-
-`-timeout=5` on the last one matters specifically: a log line is matched
-against an operator-authored `std::regex`, which can hang (not crash) on
-a pathological pattern+input combination (ReDoS) - a plain crash-only
-fuzzing run wouldn't catch that class of bug. Not part of `all`/`test` -
-these run until you stop them, so they're a developer/CI-triggered thing,
-not a build step.
-
-`make fuzz` needs clang's `compiler-rt` runtime (where libFuzzer itself
-lives), which the base `clang`/`llvm` packages above don't always pull in
-as a dependency:
-
-```bash
-# Fedora/RHEL
-sudo dnf install -y compiler-rt
-# Ubuntu/Debian - package name's version suffix tracks your installed clang's
-sudo apt install -y libclang-rt-18-dev
-```
-
----
-
-## 🌐 IPv6 header parsing
-
-[ADR-0008](docs/adr/0008-ipv6-header-parsing.md) has the full writeup.
-`xdp_prog.bpf.c` now recognizes IPv6 traffic (previously it took the same
-silent, uncounted `XDP_PASS` branch as ARP or anything else non-IPv4),
-parses the fixed 40-byte IPv6 header, and classifies TCP/UDP/ICMPv6
-packets into the **same** `proto_stats` counters IPv4 traffic already
-uses - so `xdp_tcp_packets_total` (etc.) now means "this protocol, either
-IP version", not "IPv4 only". This is visibility, not enforcement: every
-IPv6 packet still passes unconditionally. `allowed_ips`/`blocked_ips`/
-`rate_state`/`scan_state`/`icmp_state` remain IPv4-only, `__u32`-keyed
-maps - there is no way to block an IPv6 address with this firewall today
-(see the ADR's Known gap).
-
-A new tool verifies the kernel-side parsing logic itself, without needing
-a NIC:
-
-```bash
-make xdp-prog-test          # needs CAP_BPF to load an XDP-type program - run as root
-sudo ./tools/xdp-prog-test
-```
-
-It loads the real, compiled `xdp_prog.bpf.o` and runs synthetic IPv4 and
-IPv6 packets through it via `BPF_PROG_TEST_RUN` (the same mechanism the
-kernel's own BPF selftests use), checking both the returned verdict and
-the counters it bumps - including a packet carrying an IPv6 extension
-header, which demonstrates the one stated parsing limitation (extension
-headers aren't walked; the packet is classified by the extension header's
-own protocol number, not its real TCP/UDP/ICMPv6 payload) rather than
-just asserting it in prose. Not part of `all`/`test`, same reasoning as
-`asan`/`fuzz` being separate opt-in targets.
-
----
-
-## 🖥️ Live Showcase Dashboard
-
-Navigate to **`http://127.0.0.1:5000/?showcase=1`** for the presentation/exhibition UI:
-
-* **Top-Right Mode Badge:**
-  * 🔴 **ENFORCE MODE:** Active hardware packet drops enforced at the driver level.
-  * 🔵 **DETECT MODE:** Real-time log & signature auditing without dropping packets.
-  * ⚪ **Loading Mode...:** Engine offline or awaiting connection (updates automatically via AJAX without page reloads).
-* **Total Packets Dropped:** Real-time cumulative hardware drop counter.
-* **Drop Rate Meter:** Instantaneous packets-per-second drop velocity.
-* **Active Blocks / Attack Cards:** Displays currently blocked IPs with live countdown timers.
-* **Live Engine Feed:** Color-coded audit trail of incoming detections, playbooks, and mitigation events.
-
----
-
-## 🧪 Testing & Attack Simulation Lab
-
-Use these safe test commands from another machine (or WSL / VM / local terminal) to simulate attacks and verify engine responses.  
-*(Replace `<SERVER_IP>` with the IP of your machine running the engine).*
-
-### 1. Web Exploits (SQL Injection & Path Traversal)
-Sends malicious HTTP queries detected by the Nginx access log parser:
-```bash
-# SQL Injection attempt:
-curl -m 5 "http://<SERVER_IP>/?id=1%27%20OR%201=1--"
-
-# Directory Traversal attempt:
-curl -m 5 --path-as-is "http://<SERVER_IP>/../../../../etc/passwd"
-```
-
-### 2. SSH Brute-Force Protection
-Triggers the stateful sliding-window rule (5 failed attempts within 60 seconds):
-```bash
-# Automated brute-force simulation using Hydra:
-hydra -l testuser -p wrongpass <SERVER_IP> ssh
-
-# Or manually attempt 5 failed logins:
-ssh wronguser@<SERVER_IP>
-```
-
-### 3. Network Port Scanning
-Scans ports to trigger kernel-level port sweep detection:
-```bash
-# Fast SYN scan across ports 1-30:
-nmap -Pn -sS -p 1-30 <SERVER_IP>
-```
-
-### 4. Multi-Stage Attack Correlation (The "Killshot")
-Tests the `SCAN_THEN_BRUTE` sequence correlation engine:
-1. First, execute a port scan: `nmap -Pn -sS -p 1-25 <SERVER_IP>`
-2. Within 5 minutes, attempt an SSH login failure: `ssh fakeuser@<SERVER_IP>`
-3. The engine correlates both signals into an escalated high-severity ban.
-
-### 5. Volumetric SYN Flood (DDoS Mitigation)
-Demonstrates line-rate kernel packet dropping:
-```bash
-# High-speed TCP SYN flood:
-sudo hping3 -S -p 80 --flood <SERVER_IP>
-
-# Multi-process parallel flood (higher PPS across multiple CPU cores):
-for i in {1..8}; do sudo hping3 -S -p 80 --flood <SERVER_IP> & done
-
-# Random IP spoofed botnet flood (tests 1,000,000 IP hash map capacity):
-sudo hping3 -S -p 80 --flood --rand-source <SERVER_IP>
-```
-
-### 6. High-Speed 1-2 Million Drops/Sec Benchmark
-*(Note: Physical Wi-Fi radio channels are physically capped around 30k–80k frames/sec due to 802.11 airtime and ACK overhead. To demonstrate XDP's full **1,000,000 to 2,000,000+ packets/sec** capability, use the in-memory virtual lab):*
-
-1. **Start the Virtual Lab Interface:**
-   ```bash
-   ./tools/setup_veth_lab.sh start
-   ```
-2. **Start enforcement, Local API, and the engine on the virtual interface**
-   (three terminals, in this order — see [Step 4](#step-4-launch-enforcement-the-local-api-and-the-engine-in-that-order)):
-   ```bash
-   sudo ./bouncer-xdp veth-bench
-   LOCAL_API_TOKEN=your-secret ./local-api engine.db 8088
-   sudo ./engine veth-bench --enforce
-   ```
-   *Type `block 198.51.100.2` in the engine console, then `list` — wait*
-   *for it to show `[enforced]` (bouncer-xdp's next poll, ≤2s) before*
-   *starting the flood below, or the first couple seconds of packets will*
-   *pass through before enforcement catches up.*
-3. **Launch the Multi-Thread Batch Generator (another terminal):**
-   ```bash
-   sudo ./tools/bench_flood 198.51.100.1 198.51.100.2 4 veth-gen 80
-   ```
-   *Watch the live showcase dashboard at `http://127.0.0.1:5000/?showcase=1` instantly display **1.5M - 2.0M+ drops/sec**!*
-4. **Clean up when finished:**
-   ```bash
-   sudo ./bouncer-xdp cleanup veth-bench
-   ./tools/setup_veth_lab.sh stop
-   ```
-
----
-
-## ⚙️ Configuration Files
-
-* **`rules.yaml`:** Defines detection rules, regex signatures, sliding-window thresholds, and severity ratings.
-* **`playbooks.yaml`:** Configures response actions per rule (e.g. kernel block duration, Slack/webhook notifications, escalation paths).
-* **`known_ips.txt`:** Permanent administrative IP whitelist.
-* **`blocklist.txt`:** Static permanent IP blacklist loaded on boot.
-* **`parsers/s01-parse/*.yaml`:** Per-log-source envelope parsers (regex + field extraction) — see [Detection Parsers](#-detection-parsers-staged-pipeline).
-
----
-
-## ❓ Troubleshooting & FAQ
-
-**Q: The dashboard top-right badge stays on "Loading Mode..."?**  
-* Ensure the engine is running (`sudo ./engine <INTERFACE>`). When the engine starts, it updates the status in `engine.db` within 1 second.
-* Ensure both the engine and dashboard are run from the project root (`~/xdp-engine`).
-
-**Q: "open failed: Permission denied"?**  
-* eBPF operations require root privileges. Always execute `./bouncer-xdp` and `./engine` using `sudo`.
-
-**Q: `engine` won't start — "could not open pinned maps under /sys/fs/bpf/xdp_engine"?**  
-* `bouncer-xdp` isn't running on that interface yet (see [Step 4](#step-4-launch-enforcement-the-local-api-and-the-engine-in-that-order)) — `engine` no longer attaches XDP itself since [ADR-0002](docs/adr/0002-bouncer-xdp-separation.md), it just opens the maps `bouncer-xdp` pinned. Start `bouncer-xdp <INTERFACE>` first.
-
-**Q: How do I cleanly detach XDP if `bouncer-xdp` crashed?**  
-* A crash alone doesn't detach anything — that's the point of pinning (enforcement survives it). Run `sudo ./bouncer-xdp cleanup <INTERFACE>` to actually detach and remove the pins. If that binary is unavailable for some reason, the raw escape hatch is `sudo ip link set dev <INTERFACE> xdp off` plus `sudo rm -rf /sys/fs/bpf/xdp_engine`.
-
----
-
-## 📄 License
 This project is open-source under the [MIT License](LICENSE), with one
 exception: `xdp_prog.bpf.c` is licensed under [GPL-2.0](LICENSE-GPL-2.0)
 instead, because it uses Linux kernel eBPF helpers that the kernel's BPF
