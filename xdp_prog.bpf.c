@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/bpf.h>          // XDP_DROP, XDP_PASS, struct xdp_md, BPF_MAP_TYPE_* constants
-#include <linux/if_ether.h>     // struct ethhdr, ETH_P_IP
+#include <linux/if_ether.h>     // struct ethhdr, ETH_P_IP, ETH_P_IPV6
 #include <linux/ip.h>           // struct iphdr (IPv4 header layout)
+#include <linux/ipv6.h>         // struct ipv6hdr (IPv6 fixed header layout)
 #include <bpf/bpf_helpers.h>    // SEC(), __uint(), __type(), bpf_map_lookup_elem()
 #include <bpf/bpf_endian.h>     // bpf_htons() for byte-order conversion
 #include "common.h"
 
 #include <linux/tcp.h>          // struct tcphdr
 #include <linux/in.h>           // IPPROTO_TCP
+#include <linux/in6.h>          // IPPROTO_ICMPV6
 
 /* ---------- MAP 1: allowlist (key = source IPv4, value = boolean dummy) ---------- */
 struct {
@@ -125,9 +127,42 @@ struct {
      // RULE: you must prove every access is in
      // bounds BEFORE you touch it; otherwise load fails.
 
+     /* ---- IPv6 (ROADMAP.md "IPv6 header parsing"): visibility only ----
+      * Parses the fixed 40-byte IPv6 header far enough to classify the
+      * transport protocol for proto_stats and count the packet as
+      * "passed" - unlike every other ethertype below, which was (and
+      * remains) completely invisible to stats. Deliberately NOT extended
+      * to blocklist/allowlist/rate-limit/port-scan/ICMP-flood enforcement
+      * in this phase - every map below this point is keyed by a 32-bit
+      * IPv4 address, and giving IPv6 real enforcement needs its own
+      * 128-bit-keyed maps, drop_event/storage/API changes, and an IPv6
+      * nftables set for bouncer-nft - out of scope here, see
+      * docs/adr/0008-ipv6-header-parsing.md's Known gap. Also doesn't
+      * walk IPv6 extension headers (Hop-by-Hop, Routing, Fragment,
+      * Destination Options) - nexthdr is read directly, so a packet
+      * carrying one of those ahead of its real TCP/UDP/ICMPv6 payload is
+      * classified by the extension header's own protocol number instead
+      * (falls into the "other" bucket), not the payload's - also a
+      * stated, not silently-wrong, limitation.
+      */
+     if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+         struct ipv6hdr *ip6 = (void *)(eth + 1);
+         if ((void *)(ip6 + 1) > data_end) {        // prove the fixed 40-byte header is in bounds
+             return XDP_PASS;                       // too short to even classify - same silent-pass
+         }                                          // precedent the IPv4 path below uses for this case
+
+         if (ip6->nexthdr == IPPROTO_TCP) bump_proto(0);
+         else if (ip6->nexthdr == IPPROTO_UDP) bump_proto(1);
+         else if (ip6->nexthdr == IPPROTO_ICMPV6) bump_proto(2); // shares the IPv4 ICMP counter -
+         else bump_proto(3);                                    // see ADR-0008 on why
+
+         bump(1);           // this project's "passed" counter has never counted IPv6 traffic
+         return XDP_PASS;   // before now (the old unconditional `!= ETH_P_IP` check below passed
+     }                      // it through uncounted) - unenforced, but now visible.
+
      if (eth->h_proto != bpf_htons(ETH_P_IP)) {     // EtherType is big-endian on the wire (0x0800 = IPv4).
          return XDP_PASS;                           // Convert our constant to network order (done at
-     }                                              // compile time). Not IPv4 (ARP, IPv6, VLAN)? Let it through.
+     }                                              // compile time). Not IPv4 (ARP, VLAN, ...)? Let it through.
 
      /* ---- Layer 3: IPv4 header (starts right after Ethernet) ---- */
      struct iphdr *ip = (void *)(eth + 1);          // byte 14 of the packet

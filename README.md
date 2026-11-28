@@ -27,15 +27,16 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 10. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
 11. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
 12. [Parser fuzzing](#-parser-fuzzing)
-13. [Live Showcase Dashboard](#-live-showcase-dashboard)
-14. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+13. [IPv6 header parsing](#-ipv6-header-parsing)
+14. [Live Showcase Dashboard](#-live-showcase-dashboard)
+15. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
     - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
     - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
     - [Test 3: Network Port Scanning](#3-network-port-scanning)
     - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
     - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-15. [Configuration Files](#-configuration-files)
-16. [Troubleshooting & FAQ](#-troubleshooting--faq)
+16. [Configuration Files](#-configuration-files)
+17. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -502,6 +503,40 @@ sudo dnf install -y compiler-rt
 # Ubuntu/Debian - package name's version suffix tracks your installed clang's
 sudo apt install -y libclang-rt-18-dev
 ```
+
+---
+
+## 🌐 IPv6 header parsing
+
+[ADR-0008](docs/adr/0008-ipv6-header-parsing.md) has the full writeup.
+`xdp_prog.bpf.c` now recognizes IPv6 traffic (previously it took the same
+silent, uncounted `XDP_PASS` branch as ARP or anything else non-IPv4),
+parses the fixed 40-byte IPv6 header, and classifies TCP/UDP/ICMPv6
+packets into the **same** `proto_stats` counters IPv4 traffic already
+uses - so `xdp_tcp_packets_total` (etc.) now means "this protocol, either
+IP version", not "IPv4 only". This is visibility, not enforcement: every
+IPv6 packet still passes unconditionally. `allowed_ips`/`blocked_ips`/
+`rate_state`/`scan_state`/`icmp_state` remain IPv4-only, `__u32`-keyed
+maps - there is no way to block an IPv6 address with this firewall today
+(see the ADR's Known gap).
+
+A new tool verifies the kernel-side parsing logic itself, without needing
+a NIC:
+
+```bash
+make xdp-prog-test          # needs CAP_BPF to load an XDP-type program - run as root
+sudo ./tools/xdp-prog-test
+```
+
+It loads the real, compiled `xdp_prog.bpf.o` and runs synthetic IPv4 and
+IPv6 packets through it via `BPF_PROG_TEST_RUN` (the same mechanism the
+kernel's own BPF selftests use), checking both the returned verdict and
+the counters it bumps - including a packet carrying an IPv6 extension
+header, which demonstrates the one stated parsing limitation (extension
+headers aren't walked; the packet is classified by the extension header's
+own protocol number, not its real TCP/UDP/ICMPv6 payload) rather than
+just asserting it in prose. Not part of `all`/`test`, same reasoning as
+`asan`/`fuzz` being separate opt-in targets.
 
 ---
 

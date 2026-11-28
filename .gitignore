@@ -18,6 +18,7 @@ tools/replay-cli
 tools/fuzz-log-parser
 tools/fuzz-url-decode
 tools/fuzz-sanitize-utf8
+tools/xdp-prog-test
 crash-*
 leak-*
 timeout-*
