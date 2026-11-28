@@ -141,12 +141,12 @@ TEST(PrometheusMetricsTest, EveryMetricHasHelpAndTypeLines) {
     m.packets.xdp_mode = "ENFORCE";
     std::string body = format_prometheus_metrics(m);
 
-    for (const std::string& metric : {
+    for (const char* metric : {
              "xdp_engine_alerts_total", "xdp_engine_events_total", "xdp_engine_decisions_active",
              "xdp_engine_packets_dropped_total", "xdp_engine_packets_passed_total",
              "xdp_engine_packets_by_protocol_total", "xdp_engine_syn_rate_limit",
              "xdp_engine_mode", "xdp_engine_last_metrics_timestamp_seconds"}) {
-        EXPECT_NE(body.find("# HELP " + metric + " "), std::string::npos) << metric << " missing HELP line";
-        EXPECT_NE(body.find("# TYPE " + metric + " "), std::string::npos) << metric << " missing TYPE line";
+        EXPECT_NE(body.find(std::string("# HELP ") + metric + " "), std::string::npos) << metric << " missing HELP line";
+        EXPECT_NE(body.find(std::string("# TYPE ") + metric + " "), std::string::npos) << metric << " missing TYPE line";
     }
 }
