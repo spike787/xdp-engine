@@ -30,6 +30,45 @@ curl -H "Authorization: Bearer your-secret" \
   "http://127.0.0.1:8088/export?type=alerts&format=csv" -o alerts.csv
 ```
 
+## TLS and mTLS (ADR-0012)
+
+Off by default — every command above keeps working exactly as shown,
+in plaintext. Set these environment variables to turn TLS on:
+
+| Variable | Purpose |
+|---|---|
+| `LOCAL_API_TLS_CERT` / `LOCAL_API_TLS_KEY` | Server certificate/key (PEM). Both or neither — setting one alone is a startup error. |
+| `LOCAL_API_TLS_CLIENT_CA` | Optional. Require and verify a client certificate against this CA on every connection (mTLS), on top of — not instead of — the bearer token. |
+
+```bash
+# generate a throwaway dev CA + server cert + client cert:
+tools/gen_dev_certs.sh dev-certs
+
+# TLS only:
+LOCAL_API_TOKEN=your-secret \
+LOCAL_API_TLS_CERT=dev-certs/server.pem LOCAL_API_TLS_KEY=dev-certs/server-key.pem \
+./local-api engine.db 8088
+
+# ...or require a client cert too (mTLS):
+LOCAL_API_TOKEN=your-secret \
+LOCAL_API_TLS_CERT=dev-certs/server.pem LOCAL_API_TLS_KEY=dev-certs/server-key.pem \
+LOCAL_API_TLS_CLIENT_CA=dev-certs/ca.pem \
+./local-api engine.db 8088
+```
+
+```bash
+curl --cacert dev-certs/ca.pem -H "Authorization: Bearer your-secret" \
+  https://127.0.0.1:8088/healthz
+# with mTLS also required:
+curl --cacert dev-certs/ca.pem --cert dev-certs/client.pem --key dev-certs/client-key.pem \
+  -H "Authorization: Bearer your-secret" https://127.0.0.1:8088/healthz
+```
+
+See [Enforcement (bouncers)](enforcement.md) for the matching client-side
+flags (`--lapi-ca-cert`, `--lapi-client-cert`/`--lapi-client-key`), and
+[ADR-0012](adr/0012-tls-local-api.md) for the full design and what was
+directly verified (both TLS directions, both mTLS directions).
+
 ## Prometheus metrics
 
 `GET /metrics` reports the same numbers the live showcase dashboard

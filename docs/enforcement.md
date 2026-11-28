@@ -20,6 +20,9 @@ kernel's `blocked_ips` map to match.
 sudo ./bouncer-xdp wlp8s0
 # or, with non-default Local API settings:
 sudo ./bouncer-xdp wlp8s0 --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
+# or, against a TLS-enabled Local API (ADR-0012):
+sudo ./bouncer-xdp wlp8s0 --lapi-url https://127.0.0.1:8088 --lapi-token your-secret \
+    --lapi-ca-cert dev-certs/ca.pem
 ```
 
 On first attach it pins every map plus the XDP link itself under
@@ -47,6 +50,9 @@ sudo ./bouncer-nft
 sudo ./bouncer-nft --iface wlp8s0
 # or, with non-default Local API settings:
 sudo ./bouncer-nft --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
+# or, against a TLS-enabled Local API (ADR-0012):
+sudo ./bouncer-nft --lapi-url https://127.0.0.1:8088 --lapi-token your-secret \
+    --lapi-ca-cert dev-certs/ca.pem
 ```
 
 On first run it creates `table inet xdp_engine` with a `blocked_ips` set
@@ -81,6 +87,10 @@ capabilities to run, not just after a brief privileged startup.
 ./bouncer-proxy --backend http://127.0.0.1:3000 --listen-port 9090
 # or, with non-default Local API settings:
 ./bouncer-proxy --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
+# or, against a TLS-enabled Local API that also requires a client cert (mTLS, ADR-0012):
+./bouncer-proxy --lapi-url https://127.0.0.1:8088 --lapi-token your-secret \
+    --lapi-ca-cert dev-certs/ca.pem \
+    --lapi-client-cert dev-certs/client.pem --lapi-client-key dev-certs/client-key.pem
 ```
 
 Every request is checked against the current block set (keyed by the
@@ -100,7 +110,12 @@ run at most one enforcement mechanism per backend you care about —
 the whole host.
 
 `LOCAL_API_TOKEN`/`--lapi-token` work identically across all three
-bouncers.
+bouncers, and so do the TLS flags shown above
+(`--lapi-ca-cert`/`LAPI_CA_CERT`, `--lapi-client-cert`+`--lapi-client-key`/
+`LAPI_CLIENT_CERT`+`LAPI_CLIENT_KEY` for mTLS, and
+`--lapi-insecure-skip-verify`/`LAPI_TLS_INSECURE_SKIP_VERIFY=1` for lab
+use only) — see [Local API](local-api.md#tls-and-mtls-adr-0012) and
+[ADR-0012](adr/0012-tls-local-api.md) for the server side and full design.
 
 ## Privileges & capability drop
 

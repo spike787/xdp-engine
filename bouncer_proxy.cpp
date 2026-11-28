@@ -60,7 +60,30 @@ size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
+// TLS options for the Local API connection (ADR-0012). A self-contained
+// copy, same reasoning as fetch_decisions() itself not being shared
+// across bouncers (see ADR-0004): no shared TLS config header either.
+// Unrelated to bouncer-proxy's own listening socket or its httplib::Client
+// to the backend - this is only the libcurl path to Local API.
+struct LapiTlsConfig {
+    std::string ca_cert;     // --lapi-ca-cert / LAPI_CA_CERT
+    std::string client_cert; // --lapi-client-cert / LAPI_CLIENT_CERT (mTLS)
+    std::string client_key;  // --lapi-client-key / LAPI_CLIENT_KEY (mTLS)
+    bool insecure_skip_verify = false; // --lapi-insecure-skip-verify / LAPI_TLS_INSECURE_SKIP_VERIFY=1
+};
+
+void apply_tls_options(CURL* curl, const LapiTlsConfig& tls) {
+    if (!tls.ca_cert.empty()) curl_easy_setopt(curl, CURLOPT_CAINFO, tls.ca_cert.c_str());
+    if (!tls.client_cert.empty()) curl_easy_setopt(curl, CURLOPT_SSLCERT, tls.client_cert.c_str());
+    if (!tls.client_key.empty()) curl_easy_setopt(curl, CURLOPT_SSLKEY, tls.client_key.c_str());
+    if (tls.insecure_skip_verify) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+}
+
 bool fetch_decisions(const std::string& lapi_url, const std::string& token,
+                     const LapiTlsConfig& tls,
                      std::unordered_set<std::uint32_t>& out_ips) {
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -76,6 +99,7 @@ bool fetch_decisions(const std::string& lapi_url, const std::string& token,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    apply_tls_options(curl, tls);
 
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
@@ -175,6 +199,11 @@ int main(int argc, char** argv) {
     std::string backend_url = "http://127.0.0.1:5000"; // the showcase dashboard, by default
     int listen_port = 8080;
     int poll_interval_s = 2;
+    LapiTlsConfig tls;
+    tls.ca_cert = getenv_or("LAPI_CA_CERT", "");
+    tls.client_cert = getenv_or("LAPI_CLIENT_CERT", "");
+    tls.client_key = getenv_or("LAPI_CLIENT_KEY", "");
+    tls.insecure_skip_verify = getenv_or("LAPI_TLS_INSECURE_SKIP_VERIFY", "") == "1";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -183,10 +212,16 @@ int main(int argc, char** argv) {
         else if (arg == "--lapi-url" && i + 1 < argc) lapi_url = argv[++i];
         else if (arg == "--lapi-token" && i + 1 < argc) lapi_token = argv[++i];
         else if (arg == "--poll-interval" && i + 1 < argc) poll_interval_s = std::atoi(argv[++i]);
+        else if (arg == "--lapi-ca-cert" && i + 1 < argc) tls.ca_cert = argv[++i];
+        else if (arg == "--lapi-client-cert" && i + 1 < argc) tls.client_cert = argv[++i];
+        else if (arg == "--lapi-client-key" && i + 1 < argc) tls.client_key = argv[++i];
+        else if (arg == "--lapi-insecure-skip-verify") tls.insecure_skip_verify = true;
         else {
             std::cerr << "Usage: " << argv[0]
                       << " [--backend URL] [--listen-port PORT] [--lapi-url URL] "
-                         "[--lapi-token TOKEN] [--poll-interval SEC]\n";
+                         "[--lapi-token TOKEN] [--poll-interval SEC]\n"
+                         "       [--lapi-ca-cert FILE] [--lapi-client-cert FILE] "
+                         "[--lapi-client-key FILE] [--lapi-insecure-skip-verify]\n";
             return 1;
         }
     }
@@ -195,6 +230,15 @@ int main(int argc, char** argv) {
         std::cerr << "[warn] LOCAL_API_TOKEN is not set; requests to Local API will be "
                      "unauthenticated and will fail unless local-api was also started "
                      "without a token.\n";
+    }
+    if (tls.client_cert.empty() != tls.client_key.empty()) {
+        std::cerr << "[bouncer-proxy] --lapi-client-cert and --lapi-client-key must both be "
+                     "set for mTLS, or both left unset.\n";
+        return 1;
+    }
+    if (tls.insecure_skip_verify) {
+        std::cerr << "[bouncer-proxy] [warn] --lapi-insecure-skip-verify is set - Local API's "
+                     "TLS certificate will NOT be verified. Dev/lab use only.\n";
     }
 
     // Unlike bouncer-xdp (needs CAP_BPF/CAP_NET_ADMIN once) and bouncer-nft
@@ -225,7 +269,7 @@ int main(int argc, char** argv) {
     // accepting any connection.
     {
         std::unordered_set<std::uint32_t> initial;
-        if (!fetch_decisions(lapi_url, lapi_token, initial)) {
+        if (!fetch_decisions(lapi_url, lapi_token, tls, initial)) {
             std::cerr << "[bouncer-proxy] could not reach Local API for an initial decision "
                          "fetch - refusing to start serving with an unknown baseline (every "
                          "request would otherwise pass through unblocked until the first poll "
@@ -247,7 +291,7 @@ int main(int argc, char** argv) {
             if (!g_running || st.stop_requested()) break;
 
             std::unordered_set<std::uint32_t> desired;
-            if (fetch_decisions(lapi_url, lapi_token, desired)) {
+            if (fetch_decisions(lapi_url, lapi_token, tls, desired)) {
                 apply_decisions(desired);
             }
             // On fetch failure: leave g_blocked untouched (fail static),
