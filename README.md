@@ -23,20 +23,21 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 6. [Local API (decisions + export)](#-local-api-decisions--export)
 7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
 8. [bouncer-nft (enforcement, no XDP needed)](#-bouncer-nft-enforcement-no-xdp-needed)
-9. [Privileges & capability drop](#-privileges--capability-drop)
-10. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
-11. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
-12. [Parser fuzzing](#-parser-fuzzing)
-13. [IPv6 header parsing](#-ipv6-header-parsing)
-14. [Live Showcase Dashboard](#-live-showcase-dashboard)
-15. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+9. [bouncer-proxy (enforcement, app-layer)](#-bouncer-proxy-enforcement-app-layer)
+10. [Privileges & capability drop](#-privileges--capability-drop)
+11. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
+12. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
+13. [Parser fuzzing](#-parser-fuzzing)
+14. [IPv6 header parsing](#-ipv6-header-parsing)
+15. [Live Showcase Dashboard](#-live-showcase-dashboard)
+16. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
     - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
     - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
     - [Test 3: Network Port Scanning](#3-network-port-scanning)
     - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
     - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-16. [Configuration Files](#-configuration-files)
-17. [Troubleshooting & FAQ](#-troubleshooting--faq)
+17. [Configuration Files](#-configuration-files)
+18. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -333,6 +334,45 @@ mechanisms, and running both together is untested (see ADR-0004).
 
 ---
 
+## 🧭 bouncer-proxy (enforcement, app-layer)
+
+`bouncer-proxy` is the third Remediation Component — same `/decisions`
+feed as `bouncer-xdp`/`bouncer-nft`, but enforced as an HTTP reverse proxy
+in front of a single backend instead of at the packet layer (see
+[ADR-0010](docs/adr/0010-proxy-bouncer.md)). It's the answer to traffic
+the other two bouncers can't see at all — TLS-terminated application
+traffic, or a host with no XDP/`nf_tables` capability whatsoever — and the
+first bouncer that needs **zero** Linux capabilities to run, not just
+after a brief privileged startup.
+
+```bash
+# fronts dashboard/app.py (127.0.0.1:5000) on :8080 by default:
+./bouncer-proxy
+# front a different backend, on a different listen port:
+./bouncer-proxy --backend http://127.0.0.1:3000 --listen-port 9090
+# or, with non-default Local API settings:
+./bouncer-proxy --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
+```
+
+Every request is checked against the current block set (keyed by the
+client's TCP peer address) before anything is forwarded: a blocked client
+gets `403` immediately and the backend never sees the request; everything
+else is relayed through verbatim (method, full target including query
+string, body, and headers minus the hop-by-hop ones RFC 7230 §6.1 says a
+proxy must not forward), with the backend's response relayed back the
+same way. If the backend is unreachable, the client gets `502`.
+
+No `sudo` needed, and no `cleanup` subcommand — unlike the other two
+bouncers, `bouncer-proxy` has no persistent kernel-level state to tear
+down; its entire enforcement state is an in-memory set that disappears
+the moment the process stops. `LOCAL_API_TOKEN`/`--lapi-token` work
+exactly as they do for `bouncer-xdp`/`bouncer-nft`. As with the other two
+bouncers, run at most one enforcement mechanism per backend you care
+about — `bouncer-proxy` only protects requests that actually go through
+it, not the whole host.
+
+---
+
 ## 🔒 Privileges & capability drop
 
 See [ADR-0006](docs/adr/0006-capability-drop.md) for the full writeup
@@ -343,6 +383,7 @@ See [ADR-0006](docs/adr/0006-capability-drop.md) for the full writeup
 | `engine` | nothing, ever | drops to **zero capabilities** right after startup |
 | `bouncer-xdp` | loading/attaching the XDP program (cold start only; resuming an existing attachment needs nothing) | `CAP_BPF`+`CAP_NET_ADMIN` during cold-start attach, then **zero** |
 | `bouncer-nft` | every `nft` invocation, for its whole life | `CAP_NET_ADMIN` only, for its whole life |
+| `bouncer-proxy` | nothing, ever | drops to **zero capabilities** right after startup (had none to begin with) |
 | `local-api` | nothing | never needed privilege, unchanged |
 | either bouncer's `cleanup` subcommand | detach/unpin or flush, a short one-shot admin command | unchanged - stays fully privileged, by design |
 

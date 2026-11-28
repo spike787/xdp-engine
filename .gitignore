@@ -3,6 +3,7 @@ engine-cli
 local-api
 bouncer-xdp
 bouncer-nft
+bouncer-proxy
 engine_asan
 test_logic
 *.o
