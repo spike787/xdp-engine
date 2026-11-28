@@ -11,7 +11,7 @@ ifneq ($(ARCH_INC),)
 BPF_CFLAGS += -I$(ARCH_INC)
 endif
 
-all: xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bench replay-cli
+all: xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft bench replay-cli
 
 # Stage 1: C -> BPF bytecode inside an ELF object
 xdp_prog.bpf.o: xdp_prog.bpf.c
@@ -31,6 +31,15 @@ engine-cli: engine-cli.cpp
 bouncer-xdp: bouncer_xdp.cpp bouncer_diff.h common.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread bouncer_xdp.cpp -o $@ -lbpf -lelf -lz -lcurl
 
+# bouncer-nft (ADR-0004): the second Remediation Component. Enforces the
+# same /decisions feed as bouncer-xdp but via an nftables set, so it works
+# on hosts without a BPF/XDP-capable NIC or kernel. Needs libcurl (poll)
+# but no libbpf/sqlite3/yaml-cpp - no rule engine or BPF maps of its own.
+# The actual enforcement is the `nft` binary, invoked as a subprocess
+# (see bouncer_nft.cpp) rather than linked against libnftables.
+bouncer-nft: bouncer_nft.cpp nft_bouncer_core.h bouncer_diff.h
+	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread bouncer_nft.cpp -o $@ -lcurl
+
 bench: tools/bench_flood.c
 	gcc -O3 -Wall -Wextra tools/bench_flood.c -o tools/bench_flood -pthread
 
@@ -48,10 +57,10 @@ local-api: local_api.cpp storage.cpp storage.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
 
 clean:
-	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp tools/bench_flood tools/replay-cli
+	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp rule_engine.cpp http_detector.cpp storage.cpp
+test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp rule_engine.cpp http_detector.cpp storage.cpp
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 

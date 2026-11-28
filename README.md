@@ -22,17 +22,18 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 5. [Interactive Console Commands](#-interactive-console-commands)
 6. [Local API (decisions + export)](#-local-api-decisions--export)
 7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
-8. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
-9. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
-10. [Live Showcase Dashboard](#-live-showcase-dashboard)
-11. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+8. [bouncer-nft (enforcement, no XDP needed)](#-bouncer-nft-enforcement-no-xdp-needed)
+9. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
+10. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
+11. [Live Showcase Dashboard](#-live-showcase-dashboard)
+12. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
     - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
     - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
     - [Test 3: Network Port Scanning](#3-network-port-scanning)
     - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
     - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-12. [Configuration Files](#-configuration-files)
-13. [Troubleshooting & FAQ](#-troubleshooting--faq)
+13. [Configuration Files](#-configuration-files)
+14. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -237,6 +238,44 @@ sudo ./bouncer-xdp cleanup wlp8s0
 
 `LOCAL_API_TOKEN` is read from the environment the same way `local-api`
 reads it; `--lapi-token` overrides it.
+
+---
+
+## 🧱 bouncer-nft (enforcement, no XDP needed)
+
+`bouncer-nft` is a second, independent Remediation Component — same role
+as `bouncer-xdp` (polls Local API's `GET /decisions`, reconciles an
+enforcement surface to match), but via an nftables set instead of a BPF
+map, so it works on any host with `nft`/`nf_tables` and no XDP-capable NIC
+or kernel required (see [ADR-0004](docs/adr/0004-nftables-bouncer.md)).
+It trades `bouncer-xdp`'s line-rate packets-per-second ceiling for
+running basically anywhere.
+
+```bash
+sudo ./bouncer-nft
+# scope enforcement to one interface instead of all of them:
+sudo ./bouncer-nft --iface wlp8s0
+# or, with non-default Local API settings:
+sudo ./bouncer-nft --lapi-url http://127.0.0.1:8088 --lapi-token your-secret --poll-interval 2
+```
+
+On first run it creates `table inet xdp_engine` with a `blocked_ips` set
+and an `input`-hook rule dropping `ip saddr @blocked_ips`. Restarting
+`bouncer-nft` resumes against the existing table/set/rule rather than
+duplicating them — the live set contents are read back and reconciled
+against `/decisions` on the very next poll, the same resume-safety
+guarantee `bouncer-xdp` makes for its pinned BPF map. To remove the table
+entirely:
+
+```bash
+sudo ./bouncer-nft cleanup
+```
+
+Run at most one bouncer at a time per host — `bouncer-xdp` and
+`bouncer-nft` both independently enforce the same decisions by different
+mechanisms, and running both together is untested (see ADR-0004).
+`LOCAL_API_TOKEN`/`--lapi-token` work exactly as they do for
+`bouncer-xdp`.
 
 ---
 
