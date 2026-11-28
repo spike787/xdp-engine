@@ -85,3 +85,13 @@ XDP attach requires a real Linux kernel with `CAP_BPF`/`CAP_NET_ADMIN` and
 a real NIC. Agent-side sandboxes used for this work can build and unit-test
 everything except the actual kernel attach/enforcement path — that must be
 verified on a real box (VM or VPS) before being called done.
+
+This is a sharper trap than it sounds: see
+[docs/adr/0011-multihost-lab.md](docs/adr/0011-multihost-lab.md) for a
+concrete case where `bouncer-xdp` attached to a software veth interface
+with no reported error, pinned its maps correctly, and still never
+actually processed a single packet in one such sandbox - a clean attach
+and a correctly-updated map are not sufficient evidence that enforcement
+works. Don't treat "it attached without an error" as done for any
+kernel-attach change; confirm packet-level behavior (stats counters
+moving, not just the attach call succeeding) on real hardware.
