@@ -23,15 +23,16 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 6. [Local API (decisions + export)](#-local-api-decisions--export)
 7. [bouncer-xdp (enforcement)](#️-bouncer-xdp-enforcement)
 8. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
-9. [Live Showcase Dashboard](#-live-showcase-dashboard)
-10. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+9. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
+10. [Live Showcase Dashboard](#-live-showcase-dashboard)
+11. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
     - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
     - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
     - [Test 3: Network Port Scanning](#3-network-port-scanning)
     - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
     - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-11. [Configuration Files](#-configuration-files)
-12. [Troubleshooting & FAQ](#-troubleshooting--faq)
+12. [Configuration Files](#-configuration-files)
+13. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -277,6 +278,53 @@ This only replaces *envelope* parsing. The attack-signature pattern lists
 that classify an HTTP request as traversal/SQLi/scanner already live in
 `rules.yaml` and are untouched by this — see the ADR for why those
 weren't also duplicated into parser YAML.
+
+---
+
+## ▶️ replay-cli (log replay / backtesting)
+
+`tools/replay-cli` is a standalone CLI (ROADMAP.md Phase 2) that answers
+"would this rule have fired against this log?" without touching a kernel,
+root, or the live engine at all. It feeds a captured log file through the
+same `LogParser` + `HttpClassifier` + `RuleEngine` code paths the live
+`engine` process uses, and prints what would have alerted:
+
+```bash
+./tools/replay-cli --rules rules.yaml \
+    --parser parsers/s01-parse/ssh-auth.yaml \
+    --log /var/log/auth.log
+```
+
+```
+Replayed 1 file(s) through 'parsers/s01-parse/ssh-auth.yaml' + 'rules.yaml'
+  lines read:       5
+  lines matched:    5
+  alerts fired:     1
+    - SSH_BRUTE_FORCE  src_ip=203.0.113.9  severity=high
+```
+
+* `--log` may be repeated to replay several files (e.g. rotated logs) as
+  one combined run.
+* `--format json` prints a machine-readable summary instead (counts plus
+  one object per fired alert) for piping into other tooling.
+* Pass an HTTP-style parser (`parsers/s01-parse/nginx-access.yaml`) to
+  replay web-attack logs instead — the tool classifies traversal/SQLi/
+  scanner the same way `HttpDetector` does, against the same `rules.yaml`
+  pattern lists.
+
+**Known limitation:** replayed events are timestamped with the replay's
+own wall-clock time, not any timestamp recorded in the original log
+line. For a single burst of lines (the common "did this attack log trip
+my rule" use case) that's immaterial — threshold/sequence windows still
+see the lines arrive in a tight cluster. It does mean a log file whose
+entries were originally spread across hours replays as if they all
+happened in whatever time it takes the tool to read the file. Faithfully
+replaying original log timing would mean changing `RuleEngine`'s
+window/threshold logic to run off parsed log timestamps instead of
+`steady_clock`, which the live engine also depends on — judged out of
+scope for this phase, the same honest-scope call the ADRs make elsewhere
+about what else is and isn't built. See the comment at the top of
+`replay_core.h` for the full reasoning.
 
 ---
 

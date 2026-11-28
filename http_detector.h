@@ -5,11 +5,11 @@
 #include <string>
 #include <thread>
 #include <functional>
-#include <regex>
 #include <vector>
 #include "event.h"
 #include "rule_engine.h"
 #include "log_parser.h"
+#include "http_classifier.h"
 
 class HttpDetector {
 public:
@@ -28,14 +28,16 @@ public:
 
     // Envelope parsing (ip/path/user_agent extraction) moved to
     // parsers/s01-parse/nginx-access.yaml, loaded through LogParser - see
-    // docs/adr/0003-staged-parser-pipeline.md. Classification against the
-    // pattern lists below is unchanged.
+    // docs/adr/0003-staged-parser-pipeline.md.
     LogParser parser_{"parsers/s01-parse/nginx-access.yaml"};
 
-    // Extracted signatures
-    std::vector<std::regex> traversal_patterns_;
-    std::vector<std::regex> sqli_patterns_;
-    std::vector<std::regex> scanner_patterns_;
+    // Classification of the extracted path/user_agent against rules.yaml's
+    // http_traversal/http_sqli/http_scanner pattern lists - pulled out into
+    // HttpClassifier so replay-cli (tools/replay_cli.cpp) classifies
+    // against the exact same code path instead of a second copy of this
+    // loop. No default constructor, so it's built in HttpDetector's own
+    // constructor init list rather than here.
+    HttpClassifier classifier_;
 };
 
 #endif // HTTP_DETECTOR_H

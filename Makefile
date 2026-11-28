@@ -11,7 +11,7 @@ ifneq ($(ARCH_INC),)
 BPF_CFLAGS += -I$(ARCH_INC)
 endif
 
-all: xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bench
+all: xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bench replay-cli
 
 # Stage 1: C -> BPF bytecode inside an ELF object
 xdp_prog.bpf.o: xdp_prog.bpf.c
@@ -34,6 +34,13 @@ bouncer-xdp: bouncer_xdp.cpp bouncer_diff.h common.h
 bench: tools/bench_flood.c
 	gcc -O3 -Wall -Wextra tools/bench_flood.c -o tools/bench_flood -pthread
 
+# replay-cli (ROADMAP.md phase 2): feeds a captured log file through a
+# parsers/s01-parse/*.yaml + rules.yaml and reports what would have fired.
+# No BPF/root/kernel dependency at all - just yaml-cpp (RuleEngine,
+# LogParser) and nlohmann json (--format json, Alert::to_json).
+replay-cli: tools/replay_cli.cpp replay_core.h http_classifier.h log_parser.h rule_engine.h rule_engine.cpp
+	$(CXX) -std=c++20 -O2 -Wall -Wextra tools/replay_cli.cpp rule_engine.cpp -o tools/$@ -lyaml-cpp
+
 # Local API: the shared control plane (ROADMAP.md phase 1). No BPF/libcurl
 # dependency — it only needs the storage layer and an HTTP server.
 HTTPLIB_FLAGS := $(shell pkg-config --cflags --libs cpp-httplib 2>/dev/null)
@@ -41,10 +48,10 @@ local-api: local_api.cpp storage.cpp storage.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
 
 clean:
-	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp tools/bench_flood
+	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp tools/bench_flood tools/replay-cli
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp rule_engine.cpp http_detector.cpp storage.cpp
+test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp rule_engine.cpp http_detector.cpp storage.cpp
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 
