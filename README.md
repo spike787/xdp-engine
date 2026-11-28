@@ -26,15 +26,16 @@ Filters millions of malicious packets per second in Linux kernel space at driver
 9. [Privileges & capability drop](#-privileges--capability-drop)
 10. [Detection Parsers (staged pipeline)](#-detection-parsers-staged-pipeline)
 11. [replay-cli (log replay / backtesting)](#-replay-cli-log-replay--backtesting)
-12. [Live Showcase Dashboard](#-live-showcase-dashboard)
-13. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
+12. [Parser fuzzing](#-parser-fuzzing)
+13. [Live Showcase Dashboard](#-live-showcase-dashboard)
+14. [Testing & Attack Simulation Lab](#-testing--attack-simulation-lab)
     - [Test 1: Web Exploits (SQLi & Path Traversal)](#1-web-exploits-sql-injection--path-traversal)
     - [Test 2: SSH Brute-Force Protection](#2-ssh-brute-force-protection)
     - [Test 3: Network Port Scanning](#3-network-port-scanning)
     - [Test 4: Multi-Stage Attack Correlation ("Killshot")](#4-multi-stage-attack-correlation-the-killshot)
     - [Test 5: Volumetric SYN Flood (DDoS Mitigation)](#5-volumetric-syn-flood-ddos-mitigation)
-14. [Configuration Files](#-configuration-files)
-15. [Troubleshooting & FAQ](#-troubleshooting--faq)
+15. [Configuration Files](#-configuration-files)
+16. [Troubleshooting & FAQ](#-troubleshooting--faq)
 
 ---
 
@@ -465,6 +466,42 @@ window/threshold logic to run off parsed log timestamps instead of
 scope for this phase, the same honest-scope call the ADRs make elsewhere
 about what else is and isn't built. See the comment at the top of
 `replay_core.h` for the full reasoning.
+
+---
+
+## 🐛 Parser fuzzing
+
+[ADR-0007](docs/adr/0007-parser-fuzzing.md) has the full writeup. Three
+`libFuzzer` harnesses under `tools/` target the parts of this codebase
+that actually run on attacker-reachable bytes - a log line's envelope
+regex (`LogParser::parse()`), and the two hand-rolled, byte-level
+`url_decode()`/`sanitize_utf8()` helpers every extracted field goes
+through (`text_util.h`):
+
+```bash
+make fuzz               # builds all three (needs clang's fuzzer+ASan+UBSan runtime)
+./tools/fuzz-url-decode      -max_total_time=60 fuzz/corpus/url_decode
+./tools/fuzz-sanitize-utf8   -max_total_time=60 fuzz/corpus/sanitize_utf8
+./tools/fuzz-log-parser      -max_total_time=120 -timeout=5 fuzz/corpus/log_parser
+```
+
+`-timeout=5` on the last one matters specifically: a log line is matched
+against an operator-authored `std::regex`, which can hang (not crash) on
+a pathological pattern+input combination (ReDoS) - a plain crash-only
+fuzzing run wouldn't catch that class of bug. Not part of `all`/`test` -
+these run until you stop them, so they're a developer/CI-triggered thing,
+not a build step.
+
+`make fuzz` needs clang's `compiler-rt` runtime (where libFuzzer itself
+lives), which the base `clang`/`llvm` packages above don't always pull in
+as a dependency:
+
+```bash
+# Fedora/RHEL
+sudo dnf install -y compiler-rt
+# Ubuntu/Debian - package name's version suffix tracks your installed clang's
+sudo apt install -y libclang-rt-18-dev
+```
 
 ---
 

@@ -57,7 +57,7 @@ local-api: local_api.cpp storage.cpp storage.h prometheus_metrics.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
 
 clean:
-	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli
+	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli tools/fuzz-url-decode tools/fuzz-sanitize-utf8 tools/fuzz-log-parser
 
 # Stage 3: Unit Tests
 test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp tests/test_prometheus_metrics.cpp tests/test_capdrop.cpp rule_engine.cpp http_detector.cpp storage.cpp
@@ -70,3 +70,25 @@ engine_asan: engine.cpp rule_engine.cpp storage.cpp playbook_runner.cpp notifier
 	$(CXX) -std=c++20 $(ASAN_FLAGS) -Wall -Wextra -pthread $^ -o $@ -lbpf -lelf -lz -lyaml-cpp -lsqlite3 -lcurl
 
 asan: engine_asan
+
+# Stage 5: Parser fuzzing (ROADMAP.md phase 3, ADR-0007). Needs clang's
+# libFuzzer+ASan+UBSan runtime - already present if you installed clang
+# for Stage 1, but Ubuntu/Debian split it into a separate package the base
+# `clang` package doesn't pull in (libclang-rt-<ver>-dev; Fedora's
+# `compiler-rt` package bundles it already). Not part of `all`/`test` -
+# these are developer/CI-triggered tools you run for a bounded time
+# (-max_total_time=N), not binaries the project ships or a step that could
+# hang a normal build.
+CLANGXX ?= clang++
+FUZZ_FLAGS := -std=c++20 -g -O1 -fsanitize=fuzzer,address,undefined
+
+fuzz-url-decode: tools/fuzz_url_decode.cpp text_util.h
+	$(CLANGXX) $(FUZZ_FLAGS) tools/fuzz_url_decode.cpp -o tools/$@
+
+fuzz-sanitize-utf8: tools/fuzz_sanitize_utf8.cpp text_util.h
+	$(CLANGXX) $(FUZZ_FLAGS) tools/fuzz_sanitize_utf8.cpp -o tools/$@
+
+fuzz-log-parser: tools/fuzz_log_parser.cpp replay_core.h http_classifier.h log_parser.h rule_engine.h rule_engine.cpp
+	$(CLANGXX) $(FUZZ_FLAGS) tools/fuzz_log_parser.cpp rule_engine.cpp -o tools/$@ -lyaml-cpp
+
+fuzz: fuzz-url-decode fuzz-sanitize-utf8 fuzz-log-parser
