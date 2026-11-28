@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <grp.h>
 #include <net/if.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -34,6 +35,7 @@
 #include <nlohmann/json.hpp>
 
 #include "bouncer_diff.h"
+#include "capdrop.h"
 #include "common.h"
 
 namespace {
@@ -139,6 +141,47 @@ bool pin_all_maps(struct bpf_object* obj) {
 
 int open_pinned_map(const char* name) {
     return bpf_obj_get(pin_path(name).c_str());
+}
+
+// ADR-0006 (optional, opt-in): chgrp+chmod every pin under XDP_ENGINE_PIN_DIR
+// to a shared group so engine - which never holds any capability at all,
+// see capdrop.h - can open and read/write them as a genuinely non-root user,
+// rather than needing to stay root (or hold CAP_BPF) just to get past the
+// bpffs directory's default root:root 0700 permissions. Off by default
+// (XDP_ENGINE_GROUP unset): existing deployments that run everything as
+// root are unaffected. Only runs on a fresh cold-start attach, since an
+// existing resumed-from pin's ownership was already handled the first time
+// it was created.
+void maybe_chgrp_pins(struct bpf_object* obj) {
+    const char* group_name = std::getenv("XDP_ENGINE_GROUP");
+    if (!group_name || !*group_name) return;
+
+    struct group* gr = getgrnam(group_name);
+    if (!gr) {
+        std::cerr << "[bouncer-xdp] XDP_ENGINE_GROUP=" << group_name
+                  << " does not name a real group - leaving pins root-owned ("
+                  << std::strerror(errno) << ")\n";
+        return;
+    }
+
+    auto chgrp_one = [&](const std::string& path, mode_t mode) {
+        if (chown(path.c_str(), static_cast<uid_t>(-1), gr->gr_gid) != 0) {
+            std::cerr << "[bouncer-xdp] chown " << path << " to group " << group_name
+                      << " failed: " << std::strerror(errno) << "\n";
+            return;
+        }
+        if (chmod(path.c_str(), mode) != 0) {
+            std::cerr << "[bouncer-xdp] chmod " << path << " failed: " << std::strerror(errno) << "\n";
+        }
+    };
+
+    chgrp_one(XDP_ENGINE_PIN_DIR, 0750); // dir: group can traverse + list, not write new pins
+    struct bpf_map* map;
+    bpf_object__for_each_map(map, obj) {
+        chgrp_one(pin_path(bpf_map__name(map)), 0660); // engine both reads and updates these
+    }
+    std::cout << "[bouncer-xdp] pinned maps now group-readable/writable by '" << group_name
+              << "' - engine can run as a non-root member of that group\n";
 }
 
 bool already_attached() {
@@ -304,7 +347,23 @@ int main(int argc, char** argv) {
         blocked_fd = bpf_map__fd(blocked_map);
         std::cout << "[bouncer-xdp] attached xdp_firewall to " << iface
                   << " and pinned all maps + link under " << XDP_ENGINE_PIN_DIR << "\n";
+
+        maybe_chgrp_pins(obj);
     }
+
+    // ADR-0006: everything above this line - loading+verifying the XDP
+    // program, attaching it to the interface, and pinning the result - is
+    // the only part of bouncer-xdp's life that genuinely needs CAP_BPF and
+    // CAP_NET_ADMIN (or, on the resume path above, nothing privileged at
+    // all: open_pinned_map()/read_enforced_ips() open and walk an existing
+    // pinned *map*, which the kernel gates with ordinary bpffs file
+    // permissions, not a capability). From here on the poll loop only ever
+    // calls bpf_map_update_elem()/delete_elem() on the fd already in hand,
+    // which needs no capability either - so we drop everything now rather
+    // than carrying full root privilege for a process that polls an HTTP
+    // endpoint in a loop for the rest of its life.
+    capdrop::drop_bounding_except({});
+    capdrop::drop_all_capabilities("[bouncer-xdp]");
 
     std::cout << "[bouncer-xdp] polling " << lapi_url << "/decisions every "
               << poll_interval_s << "s\n";

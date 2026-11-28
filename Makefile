@@ -18,7 +18,7 @@ xdp_prog.bpf.o: xdp_prog.bpf.c
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
 # Stage 2: C++20 -> native executable, linked against libbpf and yaml-cpp
-engine: engine.cpp rule_engine.cpp rule_engine.h storage.cpp storage.h playbook_runner.cpp playbook_runner.h notifier.cpp notifier.h http_detector.cpp http_detector.h
+engine: engine.cpp rule_engine.cpp rule_engine.h storage.cpp storage.h playbook_runner.cpp playbook_runner.h notifier.cpp notifier.h http_detector.cpp http_detector.h capdrop.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread engine.cpp rule_engine.cpp storage.cpp playbook_runner.cpp notifier.cpp http_detector.cpp -o $@ -lbpf -lelf -lz -lyaml-cpp -lsqlite3 -lcurl
 
 engine-cli: engine-cli.cpp
@@ -28,7 +28,7 @@ engine-cli: engine-cli.cpp
 # attaches it, pins the maps, and polls Local API's /decisions to keep
 # blocked_ips in sync. Needs libbpf (attach/pin) and libcurl (poll), not
 # yaml-cpp/sqlite3 - it has no rule engine or storage of its own.
-bouncer-xdp: bouncer_xdp.cpp bouncer_diff.h common.h
+bouncer-xdp: bouncer_xdp.cpp bouncer_diff.h common.h capdrop.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread bouncer_xdp.cpp -o $@ -lbpf -lelf -lz -lcurl
 
 # bouncer-nft (ADR-0004): the second Remediation Component. Enforces the
@@ -37,7 +37,7 @@ bouncer-xdp: bouncer_xdp.cpp bouncer_diff.h common.h
 # but no libbpf/sqlite3/yaml-cpp - no rule engine or BPF maps of its own.
 # The actual enforcement is the `nft` binary, invoked as a subprocess
 # (see bouncer_nft.cpp) rather than linked against libnftables.
-bouncer-nft: bouncer_nft.cpp nft_bouncer_core.h bouncer_diff.h
+bouncer-nft: bouncer_nft.cpp nft_bouncer_core.h bouncer_diff.h capdrop.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread bouncer_nft.cpp -o $@ -lcurl
 
 bench: tools/bench_flood.c
@@ -60,7 +60,7 @@ clean:
 	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp tests/test_prometheus_metrics.cpp rule_engine.cpp http_detector.cpp storage.cpp
+test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp tests/test_prometheus_metrics.cpp tests/test_capdrop.cpp rule_engine.cpp http_detector.cpp storage.cpp
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 
