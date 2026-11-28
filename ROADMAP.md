@@ -92,6 +92,15 @@ concrete case where `bouncer-xdp` attached to a software veth interface
 with no reported error, pinned its maps correctly, and still never
 actually processed a single packet in one such sandbox - a clean attach
 and a correctly-updated map are not sufficient evidence that enforcement
-works. Don't treat "it attached without an error" as done for any
-kernel-attach change; confirm packet-level behavior (stats counters
-moving, not just the attach call succeeding) on real hardware.
+works. That particular failure didn't reproduce on real hardware and
+looks specific to that one sandbox, but it was never root-caused, so the
+caution stands regardless: don't treat "it attached without an error" as
+done for any kernel-attach change; confirm packet-level behavior (stats
+counters moving, or the traffic itself actually being dropped/restored -
+not just the attach call succeeding) on real hardware. Separately, if
+`bouncer-xdp` ever needs to pin maps while running inside a non-default
+network namespace (e.g. via `ip netns exec`), mount bpffs fresh inside
+that same invocation first - `ip netns exec` gives every invocation its
+own mount namespace, and bpffs mounted in the default one doesn't carry
+over. `tools/multihost_lab.sh exec <namespace> <cmd>` does this; see
+[docs/multihost-lab.md](docs/multihost-lab.md).

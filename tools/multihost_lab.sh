@@ -28,14 +28,19 @@
 # bouncer-nft and bouncer-proxy run cleanly against this topology: give
 # each its own namespace (host-nft, host-proxy) and it enforces
 # independently via real, namespace-scoped kernel state (an nftables
-# table, or nothing at all). bouncer-xdp is a different story in some
-# sandboxed/cloud agent environments specifically - see docs/multihost-lab.md
-# for what was found running this exact script in one such environment
-# (generic-mode XDP attached without error, yet never actually processed a
-# single packet) before concluding bouncer-xdp enforces correctly here.
-# This is exactly the "needs a real box" caveat ROADMAP.md's environment
-# note already carries, now with a concrete failure mode behind it rather
-# than just a general caution.
+# table, or nothing at all). bouncer-xdp needs one extra step: `ip netns
+# exec` gives every invocation a brand-new mount namespace (that's how it
+# scopes /sys/class/net to just that namespace's interfaces), and bpffs
+# mounted at /sys/fs/bpf in the root mount namespace does NOT carry over
+# into that fresh one - so bouncer-xdp's map-pinning (ADR-0002) fails with
+# ENOENT unless bpffs is (re-)mounted inside that same invocation, every
+# time. Use `exec` below instead of raw `ip netns exec` for host-xdp so
+# that mount always happens. See docs/multihost-lab.md for the full
+# investigation (an initial run without this mount failed in a way that
+# briefly looked like a deeper XDP/environment limitation before the
+# mount-namespace root cause was found and confirmed fixed on real
+# hardware: traffic to host-xdp was actually dropped and restored, not
+# just logged).
 set -e
 
 BRIDGE="br-lab"
@@ -114,11 +119,20 @@ case "$1" in
         echo "    Enforcement nodes, each in its own namespace:"
         for name in "${!NODES[@]}"; do
             [ "$name" = "client" ] && continue
-            echo "      sudo ip netns exec $name bash   # ${NODES[$name]}, veth: $(veth_ns "$name")"
+            if [ "$name" = "host-xdp" ]; then
+                echo "      sudo $0 exec $name bash   # ${NODES[$name]}, veth: $(veth_ns "$name") (mounts bpffs first - see note below)"
+            else
+                echo "      sudo ip netns exec $name bash   # ${NODES[$name]}, veth: $(veth_ns "$name")"
+            fi
         done
         echo ""
         echo "    Traffic-generating node:"
         echo "      sudo ip netns exec client bash   # ${NODES[client]}"
+        echo ""
+        echo "    NOTE: use '$0 exec host-xdp <cmd>' (not raw 'ip netns exec')"
+        echo "    to run bouncer-xdp - it mounts bpffs fresh first, which bouncer-xdp"
+        echo "    needs to pin its maps (ADR-0002) and 'ip netns exec' alone doesn't"
+        echo "    carry over from the default namespace. See docs/multihost-lab.md."
         echo ""
         echo "See docs/multihost-lab.md for the full walkthrough."
         ;;
@@ -126,8 +140,22 @@ case "$1" in
         cleanup
         echo "[+] Cleaned up."
         ;;
+    exec)
+        ns="$2"
+        shift 2 2>/dev/null || true
+        if [ -z "$ns" ] || [ "$#" -eq 0 ]; then
+            echo "Usage: $0 exec <namespace> <command...>"
+            echo "  (mounts bpffs inside the namespace's mount namespace before running"
+            echo "   <command...> there - needed for bouncer-xdp's map pinning; harmless"
+            echo "   for anything else)"
+            exit 1
+        fi
+        # mount is best-effort: it may already be mounted, or the command may
+        # not need it at all, so don't let a second mount attempt abort this.
+        sudo ip netns exec "$ns" bash -c 'mount -t bpf bpf /sys/fs/bpf 2>/dev/null; exec "$@"' -- "$@"
+        ;;
     *)
-        echo "Usage: $0 {start|stop}"
+        echo "Usage: $0 {start|stop|exec}"
         exit 1
         ;;
 esac

@@ -1,7 +1,7 @@
 # ADR 0011: Network-namespace multi-host lab
 
 ## Status
-Accepted (partial result — see Known gap)
+Accepted
 
 ## Context
 
@@ -37,54 +37,58 @@ not just by each bouncer's own report but by directly inspecting
 out to prove, for two of the three bouncers, and it held under a genuine
 network/namespace boundary, not just on loopback.
 
-**`bouncer-xdp`**: did not reach the same conclusion, after three
-successive attempts, documented in full in
-[docs/multihost-lab.md](../multihost-lab.md):
+**`bouncer-xdp`**: took three attempts to get right, two of them dead
+ends, documented in full in [docs/multihost-lab.md](../multihost-lab.md):
 
 1. Its normal cold-start pinning (`/sys/fs/bpf/xdp_engine/`, ADR-0002)
-   failed inside a non-default network namespace in this sandboxed agent
-   environment specifically (`mkdir` under `/sys/fs/bpf` returned
-   `ENOENT`, even as root with every capability present) — this sandbox
-   appears to virtualize the BPF filesystem per network namespace, which
-   is not standard Linux behavior and not something the real-hardware
-   verification in PR #16/#17 ever encountered.
-2. Attaching instead to the bridge device itself, in the default
-   namespace, attached without error but broke the bridge's own L2
-   forwarding for unrelated traffic - not a legitimate workaround, just a
-   different failure.
-3. Attaching to a plain point-to-point veth pair in the default namespace
-   (mirroring `tools/setup_veth_lab.sh`'s already-proven pattern exactly)
-   attached cleanly and pinned cleanly - a direct dump of the pinned
-   `blocked_ips` map (written against this project's own `common.h` via
-   `bpf_obj_get`, since no `bpftool` build was installable against this
-   sandbox's kernel) confirmed the test decision was present and correctly
-   formed. **The packet was still not dropped** - a dump of the `stats`
-   map showed `dropped=0 passed=0`, meaning the XDP hook was never invoked
-   for a single packet on that link at all, despite the attach reporting
-   success.
+   failed inside `host-xdp`'s namespace with `mkdir ... ENOENT`. This
+   turned out to be a general property of `ip netns exec`, not a sandbox
+   artifact: each invocation gets a brand-new mount namespace (so it can
+   remount `/sys` to show only that network namespace's interfaces), and
+   bpffs mounted at `/sys/fs/bpf` in the default mount namespace doesn't
+   carry over into that fresh one. **Root cause found, and fixed**:
+   `tools/multihost_lab.sh exec <namespace> <cmd>` (re-)mounts bpffs
+   inside the same invocation before running the command, which is what
+   `bouncer-xdp` needs every time it's launched this way.
+2. Before that root cause was found, attaching instead to the bridge
+   device itself, in the default namespace, was tried as a workaround and
+   attached without error but broke the bridge's own L2 forwarding for
+   unrelated traffic - abandoned, not part of the shipped script.
+3. Also before the root cause was found, attaching to a plain
+   point-to-point veth pair in the default namespace attached cleanly and
+   pinned cleanly - a direct dump of the pinned `blocked_ips` map (written
+   against this project's own `common.h` via `bpf_obj_get`, since no
+   `bpftool` build was installable in that environment) confirmed the test
+   decision was present and correctly formed, but the packet was still not
+   dropped (`stats` showed `dropped=0 passed=0` - the hook never fired for
+   any packet on that link). This did not reproduce once the real
+   `host-xdp` namespace was used with the bpffs-mount fix on real
+   hardware, so it looks specific to whatever sandboxed environment first
+   surfaced it, not to namespaces or to `bouncer-xdp` itself - but since it
+   was never independently root-caused the way (1) was, ROADMAP.md's
+   environment note is left exactly as strict as it already was: a clean
+   attach and a correctly-updated map are still not, by themselves,
+   sufficient evidence that enforcement works; confirm actual
+   packet-level effects.
 
-That third result is the one worth stating plainly rather than explaining
-away: in this kind of environment, a clean attach and a correctly updated
-map are not sufficient evidence that enforcement actually works. This
-doesn't contradict anything already established about `bouncer-xdp` -
-every other claim about it was independently confirmed on real hardware
-in PR #16 and PR #17 - it specifically means this *kind* of environment
-cannot be used to validate the kernel packet-processing path, full stop,
-which is exactly the caution ROADMAP.md's existing environment note
-already carries. This ADR does not loosen that note; it adds a concrete
-failure mode behind it, so a future session doesn't spend time on the
-same workaround chain this one did.
+With the bpffs-mount fix in place, **`bouncer-xdp` was confirmed on real
+hardware** running inside the lab's own `host-xdp` namespace: baseline
+ping succeeded, a block decision produced 100% packet loss (and a `403`
+from the independently-running `bouncer-proxy`, from the same decision),
+and deleting the decision restored both. All three bouncers now have this
+proof, independently, from one shared `local-api`.
 
 ## Consequences
 
-- `tools/multihost_lab.sh` is a real, reusable tool for this lab, equally
-  usable on real hardware or real VMs where `bouncer-xdp`'s equivalent
-  proof remains to be completed - closing that gap needs ROADMAP.md's
-  originally-stated resource (two or more real machines), not another
-  attempt in an agent sandbox.
+- `tools/multihost_lab.sh` is a real, reusable tool for this lab on real
+  hardware or real VMs, for all three bouncers - including `bouncer-xdp`
+  via its `exec` subcommand.
 - The architecture's core claim - one control plane, many independently
-  enforcing nodes - is now demonstrated, not just diagrammed, for two of
-  the three bouncers.
+  enforcing nodes - is now demonstrated, not just diagrammed, for all
+  three bouncers.
+- The `ip netns exec` + bpffs interaction is worth remembering for any
+  future BPF-pinning work that might run inside a namespace: mount bpffs
+  fresh in the same invocation, don't assume it's inherited.
 
 ## Alternatives considered
 
@@ -101,8 +105,9 @@ same workaround chain this one did.
 
 ## Known gap
 
-`bouncer-xdp`'s multi-host fan-out is not yet proven anywhere - single-host
-only (real hardware, PR #16/#17) and this namespace lab (inconclusive, see
-above). Completing it needs two or more real machines or real VMs running
-`tools/multihost_lab.sh`'s topology, or the equivalent on genuinely
-separate hosts.
+None outstanding for this ADR. The one remaining loose end is the
+sandbox-only "hook never fired on a point-to-point veth" curiosity from
+attempt 3 above, which is recorded in
+[docs/multihost-lab.md](../multihost-lab.md) for the record but did not
+reproduce in the real-hardware `host-xdp` test and is not believed to
+reflect anything about `bouncer-xdp`, namespaces, or this project's code.

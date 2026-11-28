@@ -22,13 +22,14 @@ br-lab (10.99.0.1/24)
   |-- host-proxy (10.99.0.13/24) - runs bouncer-proxy + a tiny backend
 ```
 
-All four namespaces, `host-xdp` included, are part of the topology the
-script creates. Only three of them were actually exercised in the run
-documented below — **What didn't work: bouncer-xdp**, further down,
-explains why `host-xdp` itself couldn't be used as shipped in the one
-sandboxed environment this was first tried in, and what to run instead on
-real hardware, where the restriction that forced that workaround is not
-expected to apply (see that section for the exact reasoning and commands).
+All four namespaces, including `host-xdp`, are part of the topology the
+script creates, and all four are now confirmed working — `host-xdp`'s
+`bouncer-xdp` needs one extra step to run inside a namespace (see
+**bouncer-xdp and network namespaces**, below, and use
+`tools/multihost_lab.sh exec host-xdp <cmd>` rather than raw `ip netns
+exec` to get it). That section also covers two sandbox-only failures hit
+while first investigating this, neither of which reproduced on real
+hardware.
 
 ## What was actually run
 
@@ -70,105 +71,87 @@ Neither bouncer was told about the other, and neither talked to anything
 except the one shared `local-api` instance. This is the thing Phase 4 set
 out to prove, and it held.
 
-## What didn't work: bouncer-xdp
+## bouncer-xdp and network namespaces
 
-Getting `bouncer-xdp` into the same proof turned out to need three
-successive workarounds, the last of which exposed a limitation worth
-being honest about rather than quietly working around further.
+Getting `bouncer-xdp` running inside `host-xdp` surfaced a real,
+reproducible interaction between `ip netns exec` and the BPF filesystem,
+plus one separate sandbox-only curiosity along the way.
 
-1. **BPF pinning failed inside any non-default network namespace.**
-   `bouncer-xdp`'s cold-start pins its maps under
-   `/sys/fs/bpf/xdp_engine/` (ADR-0002). Inside `host-xdp`'s namespace,
-   even as root with every capability present (`cap_bpf`, `cap_sys_admin`,
-   confirmed via `capsh --decode`), `mkdir` under `/sys/fs/bpf` failed
-   with `ENOENT` — and a directory created from the default namespace was
-   invisible from inside `host-xdp`'s. This points to the BPF filesystem
-   being virtualized per network namespace in this particular sandboxed
-   agent environment specifically — not standard Linux behavior, and not
-   something ADR-0002 or the real-hardware verification in PR #16/#17 ever
-   hit.
-2. **Working around that by attaching to the bridge device itself
-   (`br-lab`) in the default namespace broke the bridge entirely.**
-   Generic-mode XDP attached to `br-lab` without error, but it silently
-   broke L2 forwarding for traffic that had nothing to do with the
-   bridge's own address — `host-nft → local-api` started timing out the
-   moment the program was attached to `br-lab`, and recovered the moment
-   it was detached. Also not something to route around further; a bridge
-   master device is not a documented or intended XDP attach point for
-   this project in the first place.
-3. **Working around *that* with a plain point-to-point veth pair**
-   (mirroring `tools/setup_veth_lab.sh`'s already-proven pattern exactly:
-   `bouncer-xdp` attached in the default namespace, where pinning does
-   work) **attached cleanly, pinned cleanly, and updated `blocked_ips`
-   correctly** — a standalone dump of the pinned map (written against
-   this project's own `common.h`/`bpf_obj_get`, since `bpftool` wasn't
-   installable against this sandbox's kernel) confirmed the client's
-   address was present with `expires_at_ns = 0` (permanent), exactly what
-   the decision should have produced. **But the packet never got
-   dropped** — a ping through that link still showed `0%` packet loss, and
-   a dump of the `stats`/`proto_stats` maps showed `dropped=0 passed=0`
-   and all four protocol counters at `0`, meaning the XDP program was
-   never invoked for a single packet on that link at all, despite
-   attaching without any reported error.
+**The root cause (reproducible, fixed, confirmed on real hardware):**
+`bouncer-xdp`'s cold-start pins its maps under `/sys/fs/bpf/xdp_engine/`
+(ADR-0002). Running it via plain `sudo ip netns exec host-xdp
+./bouncer-xdp ...` fails that pin with `ENOENT`:
 
-That third finding is the important one: the attach and the map update
-both succeed and look correct, but the actual packet-processing hook
-never fires. That's a sharper trap than "XDP needs a real NIC" — it means
-a shallow check (attach succeeds, no errors) is not sufficient evidence
-that enforcement works in an environment like this one, which is exactly
-why ROADMAP.md's existing environment note (any kernel-attach change
-"must be verified on a real box... before being called done") is correct
-as written and is not being loosened by this lab. It's being sharpened: an
-agent sandbox can get as far as a clean attach and a correctly-updated map
-and still prove nothing about actual enforcement.
-
-## Testing bouncer-xdp on real hardware
-
-None of the three failures above are expected on an ordinary Linux
-machine or VM — each one looked like a property specific to the one
-sandboxed agent environment this was first tried in (a BPF filesystem
-that behaves differently per network namespace, and/or a kernel whose XDP
-packet-processing path doesn't actually run despite a clean attach). On
-real hardware, the topology's own `host-xdp` namespace (shown above)
-should work exactly like `host-nft`'s and `host-proxy`'s did:
-
-```bash
-# Terminal 1 - shared control plane, default namespace:
-LOCAL_API_TOKEN=lab-secret ./local-api /tmp/multihost_lab.db 8088
-
-# Terminal 2 - bouncer-xdp, inside its own namespace:
-sudo ip netns exec host-xdp env LOCAL_API_TOKEN=lab-secret \
-    ./bouncer-xdp veth-xdp --lapi-url http://10.99.0.1:8088 --poll-interval 1
-
-# Terminal 3 - from the client namespace, baseline then block/unblock:
-sudo ip netns exec client ping -c3 10.99.0.11          # should succeed
-sqlite3 /tmp/multihost_lab.db "INSERT INTO decisions (ts, ip, action, reason, rule, expires_at_unix, ttl_seconds, host) VALUES (datetime('now'), '10.99.0.2', 'block', 'test', 'test', $(($(date +%s)+600)), 600, 'lab-ctrl');"
-sleep 2
-sudo ip netns exec client ping -c3 10.99.0.11          # should now fail (100% loss)
-sqlite3 /tmp/multihost_lab.db "DELETE FROM decisions WHERE ip='10.99.0.2';"
-sleep 2
-sudo ip netns exec client ping -c3 10.99.0.11          # should succeed again
+```
+libbpf: failed to mkdir /sys/fs/bpf/xdp_engine/icmp_state: -ENOENT
+[bouncer-xdp] failed to pin map icmp_state: No such file or directory
 ```
 
-If this behaves as expected (block → ping fails, unblock → ping
-succeeds), `bouncer-xdp`'s multi-host fan-out is proven and the one
-remaining gap this lab leaves open is closed - update the **Conclusion**
-below accordingly. If it reproduces any of the three failures above even
-on real hardware, that would be a genuinely new and more serious finding
-worth its own writeup, since it would mean the restriction isn't
-sandbox-specific after all.
+This isn't a bug in `bouncer-xdp`, and it isn't sandbox-specific — it's
+how `ip netns exec` works everywhere. Each invocation gets a brand-new
+mount namespace (`unshare(CLONE_NEWNS)`) so it can remount `/sys` to show
+only that network namespace's own interfaces under `/sys/class/net`. But
+bpffs, mounted at `/sys/fs/bpf` in the *default* mount namespace, is a
+separate mount that doesn't carry over into that fresh one — so
+`/sys/fs/bpf` exists as a bare directory with nothing mounted on it, and
+pinning anything under it fails. This happens on every ordinary Linux box,
+not just in a sandbox; it was just easier to first notice in one.
+
+The fix is to (re-)mount bpffs inside the same `ip netns exec` invocation
+that runs `bouncer-xdp`, since the mount only lives as long as that
+invocation's mount namespace does. `tools/multihost_lab.sh` now has an
+`exec` subcommand that does exactly this:
+
+```bash
+sudo ./tools/multihost_lab.sh exec host-xdp env LOCAL_API_TOKEN=lab-secret \
+    ./bouncer-xdp veth-xdp --lapi-url http://10.99.0.1:8088 --poll-interval 1
+```
+
+**Confirmed on real hardware**, using the lab's own `host-xdp` namespace
+with the `exec` subcommand above: `bouncer-xdp` attached and pinned
+cleanly, and actually enforced the fan-out this lab set out to prove —
+
+- Baseline: `ping` from `client` to `host-xdp` (`10.99.0.11`) succeeded.
+- After the block decision was inserted: **100% packet loss** on that same
+  ping, and `bouncer-proxy` (running independently in `host-proxy`, from
+  the same decision) returned `403`.
+- After deleting the decision: ping succeeded again (`0%` loss), and the
+  proxy returned `200` again.
+
+That's the real thing Phase 4 asks for — actual packet drops at the
+kernel level, not just a log line saying a decision was processed — and
+all three bouncers (`bouncer-nft`, `bouncer-proxy`, `bouncer-xdp`) now
+have it, independently, from one shared `local-api`.
+
+**A separate, still-unexplained sandbox curiosity**, kept here for the
+record rather than swept away: earlier, before finding the bpffs root
+cause above, two sandbox-only workarounds were tried and are *not* part
+of the shipped script or the real-hardware result above. Attaching
+generic-mode XDP directly to the bridge device (`br-lab`) itself attached
+without error but silently broke unrelated L2 forwarding through that
+bridge — abandoned, since a bridge master device was never a documented
+attach point for this project anyway. Separately, attaching `bouncer-xdp`
+to a bare point-to-point veth pair in the *default* namespace (where
+pinning works) attached cleanly, pinned cleanly, and updated `blocked_ips`
+correctly (confirmed via a standalone libbpf dump tool), but the packet
+was never actually dropped and the `stats`/`proto_stats` maps stayed at
+all zeros — the hook itself never fired, despite every other signal
+looking correct. That specific failure did not reproduce in the real
+`host-xdp` namespace test above, so it looks like it was particular to
+that one sandboxed environment's generic-XDP path rather than a general
+risk — but since the cause was never root-caused the way the bpffs issue
+was, ROADMAP.md's environment note still stands as written: a clean
+attach plus a correctly-updated map is not, by itself, sufficient
+evidence that enforcement works. Confirm packet-level effects (like the
+ping/curl results above), not just the attach call succeeding.
 
 ## Conclusion
 
-- **Proven, in this lab, independent of any real hardware**: `bouncer-nft`
-  and `bouncer-proxy` each correctly enforce decisions from one shared
-  `local-api` instance while running in genuinely separate Linux network
-  namespaces, with no communication between them.
-- **Still open**: `bouncer-xdp`'s equivalent multi-host proof. It cannot
-  be completed in this kind of sandboxed agent environment - not due to a
-  bug in `bouncer-xdp` itself (every other property it has was already
-  verified correct on real hardware in PR #16/#17), but because this
-  environment's XDP packet-processing path does not actually fire,
-  despite every surface signal (attach, JIT compile, map updates) looking
-  correct. Confirming it needs what ROADMAP.md already asked for: two or
-  more real machines or real VMs, not another pass at a sandbox.
+**Proven**, on real hardware as well as in this lab's nft/proxy run:
+`bouncer-nft`, `bouncer-proxy`, and `bouncer-xdp` each correctly enforce
+decisions from one shared `local-api` instance while running in genuinely
+separate Linux network namespaces, with no communication between them —
+ROADMAP.md Phase 4's central architectural claim, demonstrated for all
+three bouncers. The one condition for `bouncer-xdp`: run it via
+`tools/multihost_lab.sh exec <namespace> <cmd>` rather than raw `ip netns
+exec`, so bpffs is mounted before it tries to pin its maps.
