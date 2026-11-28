@@ -44,7 +44,7 @@ clean:
 	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp tools/bench_flood
 
 # Stage 3: Unit Tests
-test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp rule_engine.cpp http_detector.cpp storage.cpp
+test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp rule_engine.cpp http_detector.cpp storage.cpp
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread $^ -o test_logic -lgtest -lgtest_main -lyaml-cpp -lsqlite3
 	./test_logic
 

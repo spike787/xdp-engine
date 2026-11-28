@@ -2,7 +2,7 @@
 #include "http_detector.h"
 #include <fstream>
 #include <iostream>
-#include "text_util.h"
+#include <unordered_map>
 #include <arpa/inet.h>
 #include <chrono>
 #include <ctime>
@@ -41,31 +41,35 @@ void HttpDetector::watch_loop(std::stop_token st) {
 
 void HttpDetector::process_line(const std::string& line) {
     if (line.size() > 4096) return; // cap line length
-    
-    // Basic nginx combined format
-    static std::regex log_rx(R"rx(^(\S+)\s+\S+\s+\S+\s+\[.*?\]\s+"(?:[A-Z]+)\s+(\S+)\s+.*?"\s+\d+\s+\d+\s+"(?:[^"]*)"\s+"([^"]*)")rx");
-    std::smatch match;
-    if (!std::regex_search(line, match, log_rx)) return;
-    
-    std::string ip = match[1].str();
-    std::string path = sanitize_utf8(url_decode(match[2].str()));
-    std::string ua = sanitize_utf8(match[3].str());
-    
-    if (!is_valid_ip(ip)) return;
-    
+
+    // Envelope parsing (ip/path/user_agent) now lives in
+    // parsers/s01-parse/nginx-access.yaml, loaded via parser_ - see
+    // docs/adr/0003-staged-parser-pipeline.md. url_decode/sanitize_utf8
+    // are applied inside LogParser::parse() itself now.
+    std::unordered_map<std::string, std::string> fields;
+    if (!parser_.parse(line, fields)) return;
+
+    auto ip_it = fields.find("ip");
+    if (ip_it == fields.end() || !is_valid_ip(ip_it->second)) return;
+    std::string ip = ip_it->second;
+    auto path_it = fields.find("path");
+    auto ua_it = fields.find("user_agent");
+    std::string path = (path_it != fields.end()) ? path_it->second : "";
+    std::string ua = (ua_it != fields.end()) ? ua_it->second : "";
+
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     char time_buf[32];
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&ts.tv_sec));
-    
+
     auto emit = [&](const std::string& type) {
         Event e;
         e.ts_iso = time_buf;
-        e.source = "http_log";
+        e.source = parser_.source();
         e.type = type;
         e.src_ip = ip;
         e.user = "";
-        e.severity = 3;
+        e.severity = parser_.severity();
         cb_(e);
     };
     
