@@ -17,12 +17,18 @@ down). It creates:
 ```
 br-lab (10.99.0.1/24)
   |-- client     (10.99.0.2/24)  - generates traffic
+  |-- host-xdp   (10.99.0.11/24) - runs bouncer-xdp against its own veth
   |-- host-nft   (10.99.0.12/24) - runs bouncer-nft
   |-- host-proxy (10.99.0.13/24) - runs bouncer-proxy + a tiny backend
 ```
 
-(`host-xdp` is deliberately not part of the default topology — see
-**What didn't work** below.)
+All four namespaces, `host-xdp` included, are part of the topology the
+script creates. Only three of them were actually exercised in the run
+documented below — **What didn't work: bouncer-xdp**, further down,
+explains why `host-xdp` itself couldn't be used as shipped in the one
+sandboxed environment this was first tried in, and what to run instead on
+real hardware, where the restriction that forced that workaround is not
+expected to apply (see that section for the exact reasoning and commands).
 
 ## What was actually run
 
@@ -115,6 +121,42 @@ why ROADMAP.md's existing environment note (any kernel-attach change
 as written and is not being loosened by this lab. It's being sharpened: an
 agent sandbox can get as far as a clean attach and a correctly-updated map
 and still prove nothing about actual enforcement.
+
+## Testing bouncer-xdp on real hardware
+
+None of the three failures above are expected on an ordinary Linux
+machine or VM — each one looked like a property specific to the one
+sandboxed agent environment this was first tried in (a BPF filesystem
+that behaves differently per network namespace, and/or a kernel whose XDP
+packet-processing path doesn't actually run despite a clean attach). On
+real hardware, the topology's own `host-xdp` namespace (shown above)
+should work exactly like `host-nft`'s and `host-proxy`'s did:
+
+```bash
+# Terminal 1 - shared control plane, default namespace:
+LOCAL_API_TOKEN=lab-secret ./local-api /tmp/multihost_lab.db 8088
+
+# Terminal 2 - bouncer-xdp, inside its own namespace:
+sudo ip netns exec host-xdp env LOCAL_API_TOKEN=lab-secret \
+    ./bouncer-xdp veth-xdp --lapi-url http://10.99.0.1:8088 --poll-interval 1
+
+# Terminal 3 - from the client namespace, baseline then block/unblock:
+sudo ip netns exec client ping -c3 10.99.0.11          # should succeed
+sqlite3 /tmp/multihost_lab.db "INSERT INTO decisions (ts, ip, action, reason, rule, expires_at_unix, ttl_seconds, host) VALUES (datetime('now'), '10.99.0.2', 'block', 'test', 'test', $(($(date +%s)+600)), 600, 'lab-ctrl');"
+sleep 2
+sudo ip netns exec client ping -c3 10.99.0.11          # should now fail (100% loss)
+sqlite3 /tmp/multihost_lab.db "DELETE FROM decisions WHERE ip='10.99.0.2';"
+sleep 2
+sudo ip netns exec client ping -c3 10.99.0.11          # should succeed again
+```
+
+If this behaves as expected (block → ping fails, unblock → ping
+succeeds), `bouncer-xdp`'s multi-host fan-out is proven and the one
+remaining gap this lab leaves open is closed - update the **Conclusion**
+below accordingly. If it reproduces any of the three failures above even
+on real hardware, that would be a genuinely new and more serious finding
+worth its own writeup, since it would mean the restriction isn't
+sandbox-specific after all.
 
 ## Conclusion
 
