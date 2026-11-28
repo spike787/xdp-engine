@@ -250,6 +250,7 @@ int Storage::get_offense_count(const std::string& ip) {
             sqlite3_step(reset_offense_stmt_.get());
         }
     }
+    sqlite3_reset(get_offense_stmt_.get()); // ADR-0009: don't leave this parked either
     return count;
 }
 
@@ -405,6 +406,17 @@ MetricsSummary Storage::get_metrics_summary() {
         // recursive - holding the lock across that call would deadlock.
         std::lock_guard<std::mutex> lock(db_mutex_);
 
+        // Every sqlite3_reset() below is matched by one right after that
+        // same statement's single row is read - see ADR-0009. Without the
+        // second reset, a statement is left parked mid-execution
+        // (SQLITE_ROW, never drained to SQLITE_DONE), and in WAL mode a
+        // connection's implicit read transaction only truly ends once
+        // *every* statement that participated in it has been reset or
+        // finalized. With three statements run back to back on this one
+        // connection each call, that left this function's answer able to
+        // stick on a stale snapshot indefinitely - confirmed by reproducing
+        // it with nothing more than two processes and a plain SQLite file,
+        // no XDP/BPF involved at all.
         sqlite3_reset(get_latest_metrics_stmt_.get());
         if (sqlite3_step(get_latest_metrics_stmt_.get()) == SQLITE_ROW) {
             auto* stmt = get_latest_metrics_stmt_.get();
@@ -420,16 +432,19 @@ MetricsSummary Storage::get_metrics_summary() {
             const unsigned char* mode_text = sqlite3_column_text(stmt, 8);
             m.packets.xdp_mode = mode_text ? reinterpret_cast<const char*>(mode_text) : "";
         }
+        sqlite3_reset(get_latest_metrics_stmt_.get());
 
         sqlite3_reset(count_alerts_stmt_.get());
         if (sqlite3_step(count_alerts_stmt_.get()) == SQLITE_ROW) {
             m.alerts_total = sqlite3_column_int64(count_alerts_stmt_.get(), 0);
         }
+        sqlite3_reset(count_alerts_stmt_.get());
 
         sqlite3_reset(count_events_stmt_.get());
         if (sqlite3_step(count_events_stmt_.get()) == SQLITE_ROW) {
             m.events_total = sqlite3_column_int64(count_events_stmt_.get(), 0);
         }
+        sqlite3_reset(count_events_stmt_.get());
     }
 
     m.active_decisions = static_cast<long long>(get_active_decisions().size());
