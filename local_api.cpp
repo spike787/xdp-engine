@@ -11,10 +11,19 @@
 // data, so it can run on the same host as the agent today and, once the
 // storage layer gains a networked backend, on a separate host later
 // without changing this file's logic.
+//
+// TLS/mTLS (ADR-0012): optional, off by default so existing plaintext
+// deployments keep working unchanged. Set LOCAL_API_TLS_CERT/_KEY to turn
+// on TLS; additionally set LOCAL_API_TLS_CLIENT_CA to require and verify
+// a client certificate from every caller (mTLS) on top of the existing
+// bearer-token check, not instead of it - the two are independent layers
+// (a stolen token alone, or a stolen cert alone, still isn't enough).
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include "storage.h"
@@ -22,8 +31,10 @@
 namespace {
 
 // Constant-time-ish compare to avoid the most obvious timing side channel
-// on the bearer token check. Not a substitute for TLS/mTLS (see
-// ROADMAP.md phase 3), but cheap to get right now.
+// on the bearer token check. TLS/mTLS (see the file header above and
+// ADR-0012) is the independent, separate control for the connection
+// itself; this is just about the token comparison not leaking its own
+// length/content via timing.
 //
 // Deliberately does NOT short-circuit on a.size() != b.size(): an early
 // return there would still run in time proportional to whether the
@@ -48,6 +59,12 @@ std::string require_env(const char* name, const std::string& fallback) {
     return v ? std::string(v) : fallback;
 }
 
+bool file_readable(const std::string& path) {
+    if (path.empty()) return false;
+    std::ifstream f(path);
+    return f.good();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -64,8 +81,67 @@ int main(int argc, char** argv) {
                      "Set it before exposing this beyond localhost.\n";
     }
 
+    // TLS (ADR-0012): both cert and key must be given together, or neither.
+    // A single one set is almost certainly a typo'd env var, not an
+    // intentional half-configuration, so this fails loudly at startup
+    // rather than silently falling back to plaintext.
+    const std::string tls_cert = require_env("LOCAL_API_TLS_CERT", "");
+    const std::string tls_key = require_env("LOCAL_API_TLS_KEY", "");
+    const std::string tls_client_ca = require_env("LOCAL_API_TLS_CLIENT_CA", "");
+    if (tls_cert.empty() != tls_key.empty()) {
+        std::cerr << "[local-api] LOCAL_API_TLS_CERT and LOCAL_API_TLS_KEY must both be set "
+                     "to enable TLS, or both left unset to run plaintext. Only one was given.\n";
+        return 1;
+    }
+    const bool tls_enabled = !tls_cert.empty();
+    if (!tls_enabled && !tls_client_ca.empty()) {
+        std::cerr << "[local-api] LOCAL_API_TLS_CLIENT_CA was set without LOCAL_API_TLS_CERT/"
+                     "_KEY - mTLS needs TLS itself enabled first.\n";
+        return 1;
+    }
+    if (tls_enabled && (!file_readable(tls_cert) || !file_readable(tls_key))) {
+        std::cerr << "[local-api] could not read LOCAL_API_TLS_CERT (" << tls_cert
+                  << ") or LOCAL_API_TLS_KEY (" << tls_key << ")\n";
+        return 1;
+    }
+    if (!tls_client_ca.empty() && !file_readable(tls_client_ca)) {
+        std::cerr << "[local-api] could not read LOCAL_API_TLS_CLIENT_CA (" << tls_client_ca << ")\n";
+        return 1;
+    }
+
     Storage storage(db_path);
-    httplib::Server svr;
+
+    // A plain httplib::Server when TLS is off (unchanged default behavior
+    // for every existing deployment); an SSLServer, constructed through the
+    // same base-class pointer, when it's on. If LOCAL_API_TLS_CLIENT_CA is
+    // also set, passing it as SSLServer's third constructor argument makes
+    // cpp-httplib require *and verify* a client certificate against that CA
+    // on every connection (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT
+    // under the hood) - a handshake with no cert, or a cert signed by some
+    // other CA, is rejected before any request handler (including the
+    // bearer-token check below) ever runs.
+    std::unique_ptr<httplib::Server> svr_owner;
+    if (tls_enabled) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        auto* ssl_svr = new httplib::SSLServer(
+            tls_cert.c_str(), tls_key.c_str(),
+            tls_client_ca.empty() ? nullptr : tls_client_ca.c_str());
+        if (!ssl_svr->is_valid()) {
+            std::cerr << "[local-api] failed to initialize TLS - check that "
+                         "LOCAL_API_TLS_CERT/_KEY (and _CLIENT_CA, if set) are valid PEM files\n";
+            delete ssl_svr;
+            return 1;
+        }
+        svr_owner.reset(ssl_svr);
+#else
+        std::cerr << "[local-api] built without CPPHTTPLIB_OPENSSL_SUPPORT - cannot enable "
+                     "TLS. Rebuild against a cpp-httplib with OpenSSL support.\n";
+        return 1;
+#endif
+    } else {
+        svr_owner = std::make_unique<httplib::Server>();
+    }
+    httplib::Server& svr = *svr_owner;
 
     auto check_auth = [&](const httplib::Request& req, httplib::Response& res) -> bool {
         if (token.empty()) return true; // explicitly opted out above
@@ -140,7 +216,9 @@ int main(int argc, char** argv) {
         res.set_content(format_prometheus_metrics(summary), "text/plain; version=0.0.4; charset=utf-8");
     });
 
-    std::cout << "[local-api] listening on :" << port << " (db=" << db_path << ")\n";
+    std::cout << "[local-api] listening on :" << port << " (db=" << db_path << ", tls="
+              << (tls_enabled ? (tls_client_ca.empty() ? "server-only" : "mutual") : "off")
+              << ")\n";
     svr.listen("0.0.0.0", port);
     return 0;
 }

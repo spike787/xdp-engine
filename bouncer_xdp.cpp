@@ -66,12 +66,33 @@ size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
+// TLS options for the Local API connection (ADR-0012). A self-contained
+// copy, same reasoning as fetch_decisions() itself not being shared
+// across bouncers (see ADR-0004): no shared TLS config header either.
+struct LapiTlsConfig {
+    std::string ca_cert;     // --lapi-ca-cert / LAPI_CA_CERT
+    std::string client_cert; // --lapi-client-cert / LAPI_CLIENT_CERT (mTLS)
+    std::string client_key;  // --lapi-client-key / LAPI_CLIENT_KEY (mTLS)
+    bool insecure_skip_verify = false; // --lapi-insecure-skip-verify / LAPI_TLS_INSECURE_SKIP_VERIFY=1
+};
+
+void apply_tls_options(CURL* curl, const LapiTlsConfig& tls) {
+    if (!tls.ca_cert.empty()) curl_easy_setopt(curl, CURLOPT_CAINFO, tls.ca_cert.c_str());
+    if (!tls.client_cert.empty()) curl_easy_setopt(curl, CURLOPT_SSLCERT, tls.client_cert.c_str());
+    if (!tls.client_key.empty()) curl_easy_setopt(curl, CURLOPT_SSLKEY, tls.client_key.c_str());
+    if (tls.insecure_skip_verify) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+}
+
 // Fetches GET {lapi_url}/decisions and fills `out_ips` with the set of
 // IPv4 addresses (network byte order, matching blocked_ips' key type)
 // that should be blocked right now. Returns false on any network/auth/
 // parse failure, in which case the caller should leave the previous
 // enforced state untouched rather than blocking everyone or no one.
 bool fetch_decisions(const std::string& lapi_url, const std::string& token,
+                     const LapiTlsConfig& tls,
                      std::unordered_set<std::uint32_t>& out_ips) {
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -87,6 +108,7 @@ bool fetch_decisions(const std::string& lapi_url, const std::string& token,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    apply_tls_options(curl, tls);
 
     CURLcode res = curl_easy_perform(curl);
     long http_code = 0;
@@ -241,7 +263,9 @@ int run_cleanup(const std::string& iface) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: sudo " << argv[0]
-                  << " <iface> [--lapi-url URL] [--lapi-token TOKEN] [--poll-interval SEC]\n";
+                  << " <iface> [--lapi-url URL] [--lapi-token TOKEN] [--poll-interval SEC]\n"
+                     "       [--lapi-ca-cert FILE] [--lapi-client-cert FILE] "
+                     "[--lapi-client-key FILE] [--lapi-insecure-skip-verify]\n";
         std::cerr << "       sudo " << argv[0] << " cleanup <iface>\n";
         return 1;
     }
@@ -259,18 +283,36 @@ int main(int argc, char** argv) {
     std::string lapi_url = getenv_or("LOCAL_API_URL", "http://127.0.0.1:8088");
     std::string lapi_token = getenv_or("LOCAL_API_TOKEN", "");
     int poll_interval_s = 2;
+    LapiTlsConfig tls;
+    tls.ca_cert = getenv_or("LAPI_CA_CERT", "");
+    tls.client_cert = getenv_or("LAPI_CLIENT_CERT", "");
+    tls.client_key = getenv_or("LAPI_CLIENT_KEY", "");
+    tls.insecure_skip_verify = getenv_or("LAPI_TLS_INSECURE_SKIP_VERIFY", "") == "1";
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--lapi-url" && i + 1 < argc) lapi_url = argv[++i];
         else if (arg == "--lapi-token" && i + 1 < argc) lapi_token = argv[++i];
         else if (arg == "--poll-interval" && i + 1 < argc) poll_interval_s = std::atoi(argv[++i]);
+        else if (arg == "--lapi-ca-cert" && i + 1 < argc) tls.ca_cert = argv[++i];
+        else if (arg == "--lapi-client-cert" && i + 1 < argc) tls.client_cert = argv[++i];
+        else if (arg == "--lapi-client-key" && i + 1 < argc) tls.client_key = argv[++i];
+        else if (arg == "--lapi-insecure-skip-verify") tls.insecure_skip_verify = true;
     }
 
     if (lapi_token.empty()) {
         std::cerr << "[warn] LOCAL_API_TOKEN is not set; requests to Local API will be "
                      "unauthenticated and will fail unless local-api was also started "
                      "without a token.\n";
+    }
+    if (tls.client_cert.empty() != tls.client_key.empty()) {
+        std::cerr << "[bouncer-xdp] --lapi-client-cert and --lapi-client-key must both be "
+                     "set for mTLS, or both left unset.\n";
+        return 1;
+    }
+    if (tls.insecure_skip_verify) {
+        std::cerr << "[bouncer-xdp] [warn] --lapi-insecure-skip-verify is set - Local API's "
+                     "TLS certificate will NOT be verified. Dev/lab use only.\n";
     }
 
     unsigned int ifindex = if_nametoindex(iface.c_str());
@@ -380,7 +422,7 @@ int main(int argc, char** argv) {
 
     while (g_running) {
         std::unordered_set<std::uint32_t> desired;
-        if (fetch_decisions(lapi_url, lapi_token, desired)) {
+        if (fetch_decisions(lapi_url, lapi_token, tls, desired)) {
             DecisionDiff diff = diff_decisions(currently_enforced, desired);
 
             for (std::uint32_t ip : diff.to_add) {
