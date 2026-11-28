@@ -4,7 +4,7 @@
 - **The Host System**: CPU, memory, and kernel stability.
 - **Protected Applications**: The web servers and SSH daemons running on the host.
 - **Engine Data**: The SQLite database containing historical offense data, alerts, and metrics.
-- **The BPF Maps**: The direct interface between user space and kernel space packet dropping.
+- **Enforcement surfaces**: the mechanisms a bouncer actually blocks traffic with — the pinned BPF maps (`bouncer-xdp`), the `nftables` table/set (`bouncer-nft`), and the in-memory blocked-IP set (`bouncer-proxy`).
 
 ## Attacker Capabilities
 We assume the attacker can:
@@ -20,6 +20,8 @@ We assume the attacker can:
 3. **The Web Dashboard**: Read-only boundary. The dashboard runs locally and pulls state directly from a read-only connection to SQLite. Attacker data is safely rendered as raw text, neutering XSS payloads.
 4. **Pinned BPF Maps**: Kernel boundary. Since the bouncer-xdp separation (see `docs/adr/0002-bouncer-xdp-separation.md`), `bouncer-xdp` is the *only* process that writes to `blocked_ips` to dictate packet blocking - it is the sole root-privileged component that loads/attaches the BPF program and owns pinning. `engine` and future tools open the same maps read-mostly via `bpf_obj_get()` against the pinned paths under `/sys/fs/bpf/xdp_engine/` rather than writing to them directly.
 5. **The Local API (`local_api.cpp`)**: Network-facing boundary. A bearer-token-protected HTTP service bouncers poll for decisions (`GET /decisions`) and analysts use for evidence export (`GET /export`). The token comparison is constant-time to avoid leaking its length or content via timing. It opens the same SQLite database the engine writes to, read-only in practice (it issues no writes of its own), in WAL mode so concurrent access is safe.
+6. **`bouncer-nft`'s nftables table** (see `docs/adr/0004-nftables-bouncer.md`): same boundary as #4 in spirit - it is the only process that writes `table inet xdp_engine`'s `blocked_ips` set - but a netfilter rule instead of a BPF map, so it needs only `CAP_NET_ADMIN`, not `CAP_BPF`.
+7. **`bouncer-proxy`'s request path** (see `docs/adr/0010-proxy-bouncer.md`): an application-layer boundary, not a kernel one - it terminates the client's HTTP connection itself and decides whether to forward or reject before the real backend ever sees the request. Its client-identification is deliberately narrow: it trusts only the raw TCP peer address (`req.remote_addr`), never an `X-Forwarded-For`/`X-Real-IP` header, so it is only a safe boundary when it is the first hop the client reaches - a deployment that puts another reverse proxy or load balancer in front of `bouncer-proxy` would see every request attributed to that intermediary's address instead of the real client's, silently defeating per-client blocking. This is a known, documented gap, not an oversight.
 
 ## Built-In Mitigations
 - **Validated IPs**: All user input, socket commands, and log file parses are strictly validated as legitimate IPv4 addresses before processing.
@@ -31,7 +33,7 @@ We assume the attacker can:
 - **Read-Only Dashboard**: The presentation layer cannot alter the system state or database.
 
 ## Known Limitations
-- **IPv4 Only**: The BPF program currently only parses and blocks IPv4 traffic. IPv6 is not supported.
+- **IPv4-Only Enforcement**: Since `docs/adr/0008-ipv6-header-parsing.md`, the BPF program recognizes and counts IPv6 traffic (TCP/UDP/ICMPv6), so it's no longer invisible - but `allowed_ips`/`blocked_ips`/the rate/scan/ICMP state maps are still IPv4-only, `__u32`-keyed maps. There is no way to block an IPv6 address with any bouncer today.
 - **Spoofed-Source SYN Floods**: The engine drops packets based on source IP. A highly distributed spoofed-source SYN flood could bypass threshold limits or erroneously block spoofed victims (though SYN cookies usually mitigate the latter).
 - **No Encrypted-Payload Inspection**: The engine cannot inspect TLS/HTTPS payloads directly in kernel space; it relies on application logs for layer 7 insights.
 - **Log Rotation**: Handled without a restart - `LogTailer` polls the watched file's inode/device and size on each pass and reopens from the start on rotation (inode change) or truncation (size shrinks below the last read offset). See `log_tailer.h` and `LogTailerTest.RotationAndTruncation`.
