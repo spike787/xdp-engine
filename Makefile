@@ -57,7 +57,7 @@ local-api: local_api.cpp storage.cpp storage.h prometheus_metrics.h
 	$(CXX) -std=c++20 -O2 -Wall -Wextra -pthread local_api.cpp storage.cpp -o $@ -lsqlite3 $(HTTPLIB_FLAGS)
 
 clean:
-	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli tools/fuzz-url-decode tools/fuzz-sanitize-utf8 tools/fuzz-log-parser
+	rm -f xdp_prog.bpf.o engine engine-cli local-api bouncer-xdp bouncer-nft tools/bench_flood tools/replay-cli tools/fuzz-url-decode tools/fuzz-sanitize-utf8 tools/fuzz-log-parser tools/xdp-prog-test
 
 # Stage 3: Unit Tests
 test: tests/test_logic.cpp tests/test_storage.cpp tests/test_bouncer_diff.cpp tests/test_log_parser.cpp tests/test_http_classifier.cpp tests/test_replay_core.cpp tests/test_nft_bouncer_core.cpp tests/test_prometheus_metrics.cpp tests/test_capdrop.cpp rule_engine.cpp http_detector.cpp storage.cpp
@@ -92,3 +92,15 @@ fuzz-log-parser: tools/fuzz_log_parser.cpp replay_core.h http_classifier.h log_p
 	$(CLANGXX) $(FUZZ_FLAGS) tools/fuzz_log_parser.cpp rule_engine.cpp -o tools/$@ -lyaml-cpp
 
 fuzz: fuzz-url-decode fuzz-sanitize-utf8 fuzz-log-parser
+
+# Stage 6: xdp-prog-test (ROADMAP.md phase 3, ADR-0008 - IPv6 header
+# parsing). Loads the real xdp_prog.bpf.o and runs synthetic packets
+# through xdp_firewall via BPF_PROG_TEST_RUN (libbpf's
+# bpf_prog_test_run_opts) - this is the kernel BPF selftests' own
+# technique for unit-testing a BPF program's packet-parsing/classification
+# logic without attaching it to a real interface. Needs CAP_BPF to load an
+# XDP-type program at all (same as bouncer-xdp/engine ever need, see
+# ADR-0006), so - like asan/fuzz - this is not part of `all`/`test`: run
+# it explicitly, as root or with CAP_BPF.
+xdp-prog-test: tools/xdp_prog_test.cpp xdp_prog.bpf.o
+	$(CXX) -std=c++20 -O2 -Wall -Wextra tools/xdp_prog_test.cpp -o tools/$@ -lbpf -lelf -lz
