@@ -13,3 +13,4 @@ __pycache__/
 report.md
 hydra.restore
 tools/bench_flood
+tools/replay-cli
